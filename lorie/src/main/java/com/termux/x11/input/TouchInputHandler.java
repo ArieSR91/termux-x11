@@ -99,13 +99,25 @@ public class TouchInputHandler {
     private final SwipeDetector mSwipePinchDetector;
 
     // Winlator-like right click: while one finger slides the cursor, a short tap of a second finger right-clicks.
-    private static final long SECOND_FINGER_TAP_MAX_MS = 300;
+    private static final long SECOND_FINGER_TAP_MAX_MS = 200;
     private int mPrimaryPointerId = -1;
     private float mPrimaryDownX, mPrimaryDownY, mPrimaryLastX, mPrimaryLastY;
     private boolean mPrimaryMoved;
     private int mSecondTapPointerId = -1;
     private long mSecondTapDownTime;
     private float mSecondTapDownX, mSecondTapDownY;
+    private boolean mSecondHolding;
+    private final android.os.Handler mSecondHoldHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    // Second finger kept down after the first one slid: press and hold the left button (drag), like a long press.
+    private final Runnable mSecondHoldRunnable = () -> {
+        if (mSecondTapPointerId == -1 || mSecondHolding
+                || !(this.mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy))
+            return;
+        if (this.mInputStrategy.onPressAndHold(InputStub.BUTTON_LEFT, true)) {
+            mSecondHolding = true;
+            this.mIsDragging = true;
+        }
+    };
 
     private InputStrategyInterface mInputStrategy;
     private final InputEventSender mInjector;
@@ -430,6 +442,7 @@ public class TouchInputHandler {
                 mPrimaryDownY = mPrimaryLastY = e.getY(0);
                 mPrimaryMoved = false;
                 mSecondTapPointerId = -1;
+                mSecondHolding = false;
                 break;
 
             case MotionEvent.ACTION_POINTER_DOWN:
@@ -439,8 +452,13 @@ public class TouchInputHandler {
                     mSecondTapDownTime = e.getEventTime();
                     mSecondTapDownX = e.getX(idx);
                     mSecondTapDownY = e.getY(idx);
-                } else
+                    mSecondHolding = false;
+                    mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
+                    mSecondHoldHandler.postDelayed(mSecondHoldRunnable, SECOND_FINGER_TAP_MAX_MS);
+                } else {
                     mSecondTapPointerId = -1;
+                    mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
+                }
                 break;
 
             case MotionEvent.ACTION_MOVE: {
@@ -453,9 +471,10 @@ public class TouchInputHandler {
 
                 if (mSecondTapPointerId != -1) {
                     int s = e.findPointerIndex(mSecondTapPointerId);
-                    if (s < 0 || Math.hypot(e.getX(s) - mSecondTapDownX, e.getY(s) - mSecondTapDownY) > slop)
+                    if (!mSecondHolding && (s < 0 || Math.hypot(e.getX(s) - mSecondTapDownX, e.getY(s) - mSecondTapDownY) > slop)) {
                         mSecondTapPointerId = -1; // the second finger slid: it is a gesture, not a tap
-                    else if (e.getPointerCount() == 2 && !mSuppressCursorMovement) {
+                        mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
+                    } else if (e.getPointerCount() == 2 && !mSuppressCursorMovement) {
                         // The gesture detector ignores multi-finger moves, keep the cursor following the first finger.
                         float dx = mPrimaryLastX - x, dy = mPrimaryLastY - y;
                         if (mInjector.scaleTouchpad) {
@@ -475,7 +494,11 @@ public class TouchInputHandler {
                 int id = e.getPointerId(idx);
                 if (id == mSecondTapPointerId) {
                     mSecondTapPointerId = -1;
-                    if (e.getEventTime() - mSecondTapDownTime <= SECOND_FINGER_TAP_MAX_MS)
+                    mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
+                    if (mSecondHolding) {
+                        mSecondHolding = false;
+                        ((InputStrategyInterface.TrackpadInputStrategy) mInputStrategy).releaseHeldButton();
+                    } else if (e.getEventTime() - mSecondTapDownTime <= SECOND_FINGER_TAP_MAX_MS)
                         mInputStrategy.onTap(InputStub.BUTTON_RIGHT);
                 } else if (id == mPrimaryPointerId && e.getPointerCount() == 2) {
                     // The first finger left, the remaining one takes over as the cursor finger.
@@ -485,12 +508,16 @@ public class TouchInputHandler {
                     mPrimaryDownY = mPrimaryLastY = e.getY(other);
                     mPrimaryMoved = false;
                     mSecondTapPointerId = -1;
+                    mSecondHolding = false;
+                    mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
                 }
                 break;
             }
 
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
+                mSecondHoldHandler.removeCallbacks(mSecondHoldRunnable);
+                mSecondHolding = false;
                 mSecondTapPointerId = -1;
                 mPrimaryPointerId = -1;
                 mPrimaryMoved = false;

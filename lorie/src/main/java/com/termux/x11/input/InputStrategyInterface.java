@@ -271,12 +271,18 @@ public interface InputStrategyInterface {
             mInjector.sendMouseWheelEvent(distanceX, distanceY);
         }
 
-        @Override
-        public void onMotionEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_UP && mHeldButton != InputStub.BUTTON_UNDEFINED) {
+        /** Releases the button pressed by onPressAndHold, if any. */
+        public void releaseHeldButton() {
+            if (mHeldButton != InputStub.BUTTON_UNDEFINED) {
                 mInjector.sendMouseUp(mHeldButton, true);
                 mHeldButton = InputStub.BUTTON_UNDEFINED;
             }
+        }
+
+        @Override
+        public void onMotionEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_UP)
+                releaseHeldButton();
         }
     }
 }
