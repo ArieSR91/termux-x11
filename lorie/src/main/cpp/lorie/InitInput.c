@@ -1,547 +1,1262 @@
-/*
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
+#pragma clang diagnostic ignored "-Wstrict-prototypes"
+#pragma ide diagnostic ignored "cppcoreguidelines-narrowing-conversions"
+#pragma ide diagnostic ignored "cert-err34-c"
+#pragma ide diagnostic ignored "ConstantConditionsOC"
+#pragma ide diagnostic ignored "ConstantFunctionResult"
+#pragma ide diagnostic ignored "bugprone-integer-division"
+#pragma clang diagnostic ignored "-Wmissing-noreturn"
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
 
-Copyright 1993, 1998  The Open Group
+#ifdef HAVE_DIX_CONFIG_H
+#include <dix-config.h>
+#endif
 
-Permission to use, copy, modify, distribute, and sell this software and its
-documentation for any purpose is hereby granted without fee, provided that
-the above copyright notice appear in all copies and that both that
-copyright notice and this permission notice appear in supporting
-documentation.
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE OPEN GROUP BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
-
-Except as contained in this notice, the name of The Open Group shall
-not be used in advertising or otherwise to promote the sale, use or
-other dealings in this Software without prior written authorization
-from The Open Group.
-
-*/
-
+#include <sys/eventfd.h>
+#include <sys/errno.h>
+#include <libxcvt/libxcvt.h>
 #include <X11/X.h>
-#include "mi.h"
-#include "scrnintstr.h"
+#include <X11/Xmd.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <present.h>
+#include <sys/mman.h>
+#include <dri3.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include "fb.h"
 #include "inputstr.h"
-#include <X11/Xos.h>
-#include <X11/XF86keysym.h>
-#include <android/log.h>
 #include "mipointer.h"
-#include "xkbsrv.h"
-#include "xserver-properties.h"
-#include "exevents.h"
+#include "micmap.h"
+#include "miline.h"
+#include "shmint.h"
+#include "present_priv.h"
+#include "misyncshm.h"
+#include "glxserver.h"
+#include "glxutil.h"
+#include "glxconfigs.h"
+#include "inpututils.h"
+#include "exa.h"
+#include "drm_fourcc.h"
+#include "opaque.h"
+
 #include "lorie.h"
 
-#define XI_PEN	"TERMUX-X11 PEN"
-#define XI_ERASER	"TERMUX-X11 ERASER"
+#define DRM_FORMAT_MOD_LINEAR 0
 
-__unused DeviceIntPtr lorieMouse, lorieTouch, lorieKeyboard, loriePen, lorieEraser;
+extern void android_shmem_sysv_shm_force(uint8_t enable);
 
-void
-ProcessInputEvents(void) {
-    mieqProcessInputEvents();
+#define unused __attribute__((unused))
+#define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
+
+extern DeviceIntPtr lorieMouse, lorieKeyboard;
+
+#define CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED 5
+
+struct vblank {
+    struct xorg_list link;
+    uint64_t id, msc;
+};
+
+static struct present_screen_info loriePresentInfo;
+static dri3_screen_info_rec lorieDri3Info;
+static ExaDriverRec lorieExa;
+
+typedef struct {
+    DamagePtr damage;
+    OsTimerPtr fpsTimer;
+
+    SetWindowPixmapProcPtr SetWindowPixmap;
+    CloseScreenProcPtr CloseScreen;
+
+    int eventFd, stateFd;
+
+    struct lorie_shared_server_state* state;
+    struct {
+        Bool legacyDrawing;
+        uint32_t width, height;
+        char name[1024];
+        uint32_t framerate;
+    } root;
+
+    Bool dri3;
+    int rendererRelock;
+
+    uint64_t vblank_interval;
+    struct xorg_list vblank_queue;
+    uint64_t current_msc;
+
+    Bool requestLockHeld;
+} lorieScreenInfo;
+
+ScreenPtr pScreenPtr;
+static lorieScreenInfo lorieScreen = {
+        .stateFd = -1,
+        .root.width = 1280,
+        .root.height = 1024,
+        .root.framerate = 30,
+        .root.name = "screen",
+        .dri3 = TRUE,
+        .vblank_queue = { &lorieScreen.vblank_queue, &lorieScreen.vblank_queue },
+}, *pvfb = &lorieScreen;
+static char *xstartup = NULL;
+static char **xstartupArgv = NULL;
+static char *documentTag = NULL;
+
+// Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
+// the first connection so callers don't need a NULL check.
+static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
+
+typedef struct {
+    LorieBuffer *buffer;
+    bool flipped, wasLocked, imported;
+    void *locked;
+    void *mem;
+} LoriePixmapPriv;
+
+#define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
+#define LORIE_BUFFER_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap))->buffer : NULL)
+
+static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    const LorieBuffer_Desc *desc;
+    if (!priv || !priv->buffer || priv->mem)
+        return NULL;
+
+    desc = LorieBuffer_description(priv->buffer);
+    if (desc->type == LORIEBUFFER_REGULAR) {
+        LorieBuffer_convert(priv->buffer, type, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
+        if (desc->type != LORIEBUFFER_REGULAR) {
+            // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
+            pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
+            LorieBuffer_lock(priv->buffer, &priv->locked);
+        }
+    }
+
+    return desc->type == type ? priv->buffer : NULL;
 }
 
-void
-DDXRingBell(__unused int volume, __unused int pitch, __unused int duration) {}
+static Bool lorieServerDebugEnabled = FALSE;
 
-static int
-lorieKeybdProc(DeviceIntPtr pDevice, int onoff) {
-    DevicePtr pDev = (DevicePtr) pDevice;
+void OsVendorInit(void) {
+    pthread_mutexattr_t mutex_attr;
 
-    switch (onoff) {
-    case DEVICE_INIT:
-        InitKeyboardDeviceStruct(pDevice, NULL, NULL, NULL);
-        break;
-    case DEVICE_ON:
-        pDev->on = TRUE;
-        break;
-    case DEVICE_OFF:
-        pDev->on = FALSE;
-        break;
-    case DEVICE_CLOSE:
-        break;
-    default:
-        return BadMatch;
+    if (lorieScreen.stateFd != -1) // already initialized
+        return;
+
+    lorieServerDebugEnabled = getenv("TERMUX_X11_DEBUG") != NULL;
+
+    if (-1 == (lorieScreen.stateFd = LorieBuffer_createRegion("xserver", sizeof(*lorieScreen.state)))) {
+        dprintf(2, "FATAL: Failed to allocate server state.\n");
+        _exit(1);
     }
+
+    if (!(lorieScreen.state = mmap(NULL, sizeof(*lorieScreen.state), PROT_READ|PROT_WRITE, MAP_SHARED, lorieScreen.stateFd, 0))) {
+        dprintf(2, "FATAL: Failed to map server state.\n");
+        _exit(1);
+    }
+
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&lorieScreen.state->lock, &mutex_attr);
+    pthread_mutex_init(&lorieScreen.state->cursor.lock, &mutex_attr);
+    lorieScreen.state->cursor.visible = TRUE;
+
+    lorieListenForKnocks(documentTag ? DOCUMENT_PORT_BASE + atoi(display) : PORT, documentTag);
+}
+
+// Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
+// signals rendererCond from lorieRedraw/lorieMoveCursor - so the swap and the unmap below can never race
+// a signal.
+static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* closure) {
+    int fd = (int) (intptr_t) closure;
+    pthread_cond_t* newCond = mmap(NULL, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd); // mmap already keeps the region alive.
+    if (newCond == MAP_FAILED) {
+        log(ERROR, "Failed to map renderer wakeup cond var, keeping the old one");
+        return TRUE;
+    }
+
+    pthread_cond_t* old = rendererCond;
+    rendererCond = newCond;
+    pthread_cond_signal(newCond); // in case a signal was sent to `old` right before this swap
+
+    if (old != &rendererCondPlaceholder)
+        munmap(old, sizeof(pthread_cond_t));
+
+    return TRUE;
+}
+
+void lorieSetRendererWakeupCond(int fd) {
+    QueueWorkProc(lorieSetRendererWakeupCondWorkProc, NULL, (void*) (intptr_t) fd);
+    lorieWakeServer();
+}
+
+void lorieActivityConnected(void) {
+    pvfb->state->drawRequested = pvfb->state->cursor.updated = true;
+    pvfb->state->rendererRelock = pvfb->rendererRelock;
+    lorieSendSharedServerState(pvfb->stateFd);
+    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+}
+
+static Bool TrueNoop() { return TRUE; }
+static Bool FalseNoop() { return FALSE; }
+static void VoidNoop() {}
+
+void ddxGiveUp(unused enum ExitCode error) {
+    log(ERROR, "Server stopped (%d)", error);
+    CloseWellKnownConnections();
+    UnlockServer();
+    exit(error);
+}
+
+static void* ddxReadyThread(unused void* cookie) {
+    if ((xstartup || xstartupArgv) && serverGeneration == 1) {
+        pid_t pid = fork();
+
+        if (!pid) {
+            char DISPLAY[16] = "";
+            sprintf(DISPLAY, ":%s", display);
+            setenv("DISPLAY", DISPLAY, 1);
+
+#define INHERIT_VAR(v) char *v = getenv("XSTARTUP_" #v); if (v && strlen(v)) setenv(#v, v, 1); unsetenv("XSTARTUP_" #v);
+            INHERIT_VAR(CLASSPATH)
+            INHERIT_VAR(LD_LIBRARY_PATH)
+            INHERIT_VAR(LD_PRELOAD)
+#undef INHERIT_VAR
+
+            if (xstartupArgv) {
+                execvp(xstartupArgv[0], xstartupArgv);
+                dprintf(2, "Failed to start command `%s`: %s\n", xstartupArgv[0], strerror(errno));
+                abort();
+            }
+
+            execlp(xstartup, xstartup, NULL);
+            execlp("sh", "sh", "-c", xstartup, NULL);
+            dprintf(2, "Failed to start command `sh -c \"%s\"`: %s\n", xstartup, strerror(errno));
+            abort();
+        } else {
+            int status;
+            do {
+                pid_t w = waitpid(pid, &status, 0);
+                if (w == -1) {
+                    perror("waitpid");
+                    GiveUp(SIGKILL);
+                }
+
+                if (WIFEXITED(status)) {
+                    printf("%d exited, status=%d\n", w, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    printf("%d killed by signal %d\n", w, WTERMSIG(status));
+                } else if (WIFSTOPPED(status)) {
+                    printf("%d stopped by signal %d\n", w, WSTOPSIG(status));
+                } else if (WIFCONTINUED(status)) {
+                    printf("%d continued\n", w);
+                }
+            } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+            GiveUp(SIGINT);
+        }
+    }
+
+    return NULL;
+}
+
+Bool drawSquares(unused ClientPtr client, unused void *closure) {
+    static const CARD32 colors[] = {0xFF0000, 0x00FF00, 0x0000FF};
+    DrawablePtr root = &pScreenPtr->root->drawable;
+    GCPtr gc = GetScratchGC(root->depth, pScreenPtr);
+    int l = min(root->width, root->height) / 4;
+
+    if (!gc)
+        return FALSE;
+
+    for (int i = 0; i < 3; i++) {
+        ChangeGCVal foreground = { .val = colors[i] };
+        xRectangle rect = { (root->width - l) / 2 + (i - 1) * (l / 3), (root->height - l) / 2 + (i - 1) * (l / 3), l, l };
+
+        ChangeGC(NullClient, gc, GCForeground, &foreground);
+        ValidateGC(root, gc);
+        gc->ops->PolyFillRect(root, gc, 1, &rect);
+    }
+
+    FreeScratchGC(gc);
+    return FALSE;
+}
+
+void ddxReady(void) {
+    CursorVisible = TRUE;
+    pScreenPtr->DisplayCursor(lorieMouse, pScreenPtr, rootCursor);
+    if (NoListenAll)
+        return;
+    if (!xstartupArgv) {
+        if (xstartup && !strlen(xstartup)) // allow overriding $TERMUX_X11_XSTARTUP with empty xstartup arg
+            return;
+        if (!xstartup || !strlen(xstartup))
+            xstartup = getenv("TERMUX_X11_XSTARTUP");
+        if (!xstartup || !strlen(xstartup))
+            return;
+    }
+
+    pthread_t t;
+    pthread_create(&t, NULL, ddxReadyThread, NULL);
+}
+
+void OsVendorFatalError(unused const char *f, unused va_list args) {
+    log(ERROR, f, args);
+}
+
+#if defined(DDXBEFORERESET)
+void ddxBeforeReset(void) {}
+#endif
+
+#if INPUTTHREAD
+/** This function is called in Xserver/os/inputthread.c when starting
+    the input thread. */
+void ddxInputThreadInit(void) {}
+#endif
+
+void ddxUseMsg(void) {
+    ErrorF("-xstartup \"command\"\n");
+    ErrorF("-- command args...     start `command` after server startup\n");
+    ErrorF("-legacy-drawing        use legacy drawing, without using AHardwareBuffers\n");
+    ErrorF("-force-bgra            force flipping colours (RGBA->BGRA)\n");
+    ErrorF("-disable-dri3          disabling DRI3 support (to let lavapipe work)\n");
+    ErrorF("-force-sysvshm         force using SysV shm syscalls\n");
+    ErrorF("-check-drawing         run server only able to draw some test image (for testing if rendering root window works or not),\n");
+    ErrorF("-tag tag               open this display in a separate Android window identified by tag\n");
+}
+
+int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
+    if (strcmp(argv[i], "-xstartup") == 0) {  /* -xstartup "command" */
+        CHECK_FOR_REQUIRED_ARGUMENTS(1);
+        if (xstartupArgv) {
+            UseMsg();
+            FatalError("-xstartup and -- are mutually exclusive\n");
+        }
+        xstartup = argv[++i];
+        return 2;
+    }
+
+    if (strcmp(argv[i], "--") == 0) {  /* -- command args...: everything after goes verbatim into xstartupArgv */
+        CHECK_FOR_REQUIRED_ARGUMENTS(1);
+        if (xstartup) {
+            UseMsg();
+            FatalError("-xstartup and -- are mutually exclusive\n");
+        }
+        int n = argc - i - 1;
+        xstartupArgv = calloc(n + 1, sizeof(char*)); /* argv passed to us isn't guaranteed NULL-terminated past argc */
+        memcpy(xstartupArgv, &argv[i + 1], n * sizeof(char*));
+        return argc - i;
+    }
+
+    if (strcmp(argv[i], "-legacy-drawing") == 0) {
+        pvfb->root.legacyDrawing = TRUE;
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-force-bgra") == 0)
+        return 1;
+
+    if (strcmp(argv[i], "-disable-dri3") == 0) {
+        pvfb->dri3 = FALSE;
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-force-sysvshm") == 0) {
+        android_shmem_sysv_shm_force(1);
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-check-drawing") == 0) {
+        NoListenAll = TRUE;
+        QueueWorkProc(drawSquares, NULL, NULL);
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-disable-gpu-present") == 0) {
+        log(WARN, "-disable-gpu-present is deprecated and should not be used, it does nothing");
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-tag") == 0) {  /* -tag tag */
+        CHECK_FOR_REQUIRED_ARGUMENTS(1);
+        documentTag = argv[++i];
+        return 2;
+    }
+
+    return 0;
+}
+
+static RRModePtr lorieCvt(int width, int height, int framerate) {
+    struct libxcvt_mode_info *info;
+    char name[128];
+    xRRModeInfo modeinfo = {0};
+    RRModePtr mode;
+
+    info = libxcvt_gen_mode_info(width, height, framerate, 0, 0);
+
+    snprintf(name, sizeof name, "%dx%d", info->hdisplay, info->vdisplay);
+    modeinfo.nameLength = strlen(name);
+    modeinfo.width      = info->hdisplay;
+    modeinfo.height     = info->vdisplay;
+    modeinfo.dotClock   = info->dot_clock * 1000.0;
+    modeinfo.hSyncStart = info->hsync_start;
+    modeinfo.hSyncEnd   = info->hsync_end;
+    modeinfo.hTotal     = info->htotal;
+    modeinfo.vSyncStart = info->vsync_start;
+    modeinfo.vSyncEnd   = info->vsync_end;
+    modeinfo.vTotal     = info->vtotal;
+    modeinfo.modeFlags  = info->mode_flags;
+
+    mode = RRModeGet(&modeinfo, name);
+    free(info);
+    return mode;
+}
+
+static Bool lorieCursorFromMouse(DeviceIntPtr pDev) {
+    return !pDev || GetMaster(pDev, MASTER_POINTER) == inputInfo.pointer;
+}
+
+void lorieSetCursorVisible(Bool visible) {
+    pvfb->state->cursor.visible = visible;
+    pvfb->state->cursor.moved = TRUE;
+    pthread_cond_signal(rendererCond);
+}
+
+static void lorieMoveCursor(DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {
+    if (!lorieCursorFromMouse(pDev))
+        return;
+
+    pvfb->state->cursor.x = x;
+    pvfb->state->cursor.y = y;
+    pvfb->state->cursor.moved = TRUE;
+    // No need to explicitly lock the mutex, it will cause waiting for rendering to be finished.
+    // We are simply signaling the renderer in the case if it sleeps.
+    pthread_cond_signal(rendererCond);
+}
+
+static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
+    CursorBitsPtr bits = pCurs->bits;
+    if (bits->argb) {
+        for (int i = 0; i < bits->width * bits->height; i++) {
+            /* Convert bgra to rgba */
+            CARD32 p = bits->argb[i];
+            data[i] = (p & 0xFF000000) | ((p & 0x00FF0000) >> 16) | (p & 0x0000FF00) | ((p & 0x000000FF) << 16);
+        }
+    } else {
+        uint32_t d, fg, bg, *p;
+        int x, y, stride, i, bit;
+
+        p = data;
+        fg = ((pCurs->foreBlue & 0xff00) << 8) | (pCurs->foreGreen & 0xff00) | (pCurs->foreRed >> 8);
+        bg = ((pCurs->backBlue & 0xff00) << 8) | (pCurs->backGreen & 0xff00) | (pCurs->backRed >> 8);
+        stride = BitmapBytePad(bits->width);
+        for (y = 0; y < bits->height; y++)
+            for (x = 0; x < bits->width; x++) {
+                i = y * stride + x / 8;
+                bit = 1 << (x & 7);
+                d = (bits->source[i] & bit) ? fg : bg;
+                d = (bits->mask[i] & bit) ? d | 0xff000000 : 0x00000000;
+                *p++ = d;
+            }
+    }
+}
+
+static void lorieSetCursor(DeviceIntPtr pDev, unused ScreenPtr pScr, CursorPtr pCurs, int x0, int y0) {
+    CursorBitsPtr bits = pCurs ? pCurs->bits : NULL;
+    if (!lorieCursorFromMouse(pDev))
+        return;
+
+    if (pCurs && (pCurs->bits->width >= 512 || pCurs->bits->height >= 512))
+        // We do not have enough memory allocated for such a big cursor, let's display default "X" cursor
+        pCurs = rootCursor;
+
+    lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid, conn_fd);
+    if (pCurs && bits) {
+        pvfb->state->cursor.xhot = bits->xhot;
+        pvfb->state->cursor.yhot = bits->yhot;
+        pvfb->state->cursor.width = bits->width;
+        pvfb->state->cursor.height = bits->height;
+        lorieConvertCursor(pCurs, pvfb->state->cursor.bits);
+    } else {
+        pvfb->state->cursor.xhot = pvfb->state->cursor.yhot = 0;
+        pvfb->state->cursor.width = pvfb->state->cursor.height = 0;
+    }
+    pvfb->state->cursor.updated = true;
+    lorie_mutex_unlock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid);
+
+    lorieMoveCursor(NULL, NULL, x0, y0);
+}
+
+static miPointerSpriteFuncRec loriePointerSpriteFuncs = {
+    .RealizeCursor = TrueNoop,
+    .UnrealizeCursor = TrueNoop,
+    .SetCursor = lorieSetCursor,
+    .MoveCursor = lorieMoveCursor,
+    .DeviceCursorInitialize = TrueNoop,
+    .DeviceCursorCleanup = VoidNoop
+};
+
+static miPointerScreenFuncRec loriePointerCursorFuncs = {
+    .CursorOffScreen = FalseNoop,
+    .CrossScreen = VoidNoop,
+    .WarpCursor = miPointerWarpCursor
+};
+
+static void loriePerformVblanks(void);
+
+static void lorieRequestLockTake(void) {
+    if (pvfb->requestLockHeld)
+        return;
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid, conn_fd);
+    pvfb->requestLockHeld = TRUE;
+}
+
+static void lorieRequestLockRelease(void) {
+    if (!pvfb->requestLockHeld)
+        return;
+    pvfb->requestLockHeld = FALSE;
+    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+
+    if (!pvfb->state->rendererWaiting)
+        return;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_nsec += 100000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    for (uint32_t v; (v = __atomic_load_n(&pvfb->state->rendererWaiting, __ATOMIC_ACQUIRE)) && lorieConnectionAlive(conn_fd); )
+        if (syscall(SYS_futex, &pvfb->state->rendererWaiting, FUTEX_WAIT_BITSET, v, &deadline, NULL, FUTEX_BITSET_MATCH_ANY) == -1 && errno == ETIMEDOUT)
+            break;
+
+    pvfb->state->rendererWaiting = FALSE;
+}
+
+void ddxRequestDone(void) {
+    if (!pvfb || !pvfb->state)
+        return;
+
+    lorieRequestLockRelease();
+}
+
+static void lorieBlockHandler(__unused void *data, __unused void *timeout) {
+    ddxRequestDone();
+}
+
+static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
+    int status, nonEmpty;
+    LoriePixmapPriv* priv;
+    PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
+
+    lorieRequestLockRelease();
+    pvfb->current_msc++;
+    loriePerformVblanks();
+
+    pvfb->state->waitForNextFrame = false;
+
+    if (!lorieConnectionAlive(conn_fd) || !pvfb->state->surfaceAvailable)
+        return TRUE;
+
+    nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
+    priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
+
+    if (!priv)
+        // Impossible situation, but let's skip this step
+        return TRUE;
+
+    if (nonEmpty && priv->buffer) {
+        // We should unlock and lock buffer in order to update texture content on some devices
+        // In most cases AHardwareBuffer uses DMA memory which is shared between CPU and GPU
+        // and this is not needed. But according to docs we should do it for any case.
+        // Also according to AHardwareBuffer docs simultaneous reading in rendering thread and
+        // locking for writing in other thread is fine. Performing it on renderer side where possible.
+        if (!pvfb->rendererRelock && priv->locked) {
+            LorieBuffer_unlock(priv->buffer);
+            status = LorieBuffer_lock(priv->buffer, &priv->locked);
+            if (status)
+                FatalError("Failed to lock the surface: %d\n", status);
+        }
+
+        DamageEmpty(pvfb->damage);
+        pvfb->state->drawRequested = TRUE;
+    }
+
+    if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
+        pvfb->state->rootWindowTextureID = LorieBuffer_description(priv->buffer)->id;
+
+        // Sending signal about pending root window changes to renderer thread.
+        // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
+        // for all drawing operations to be finished.
+        // Renderer thread will check the `drawRequested` flag right before going to sleep.
+        pthread_cond_signal(rendererCond);
+    }
+
+    return TRUE;
+}
+
+static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    if (pvfb->state->renderedFrames)
+        log(INFO, "%d frames in 5.0 seconds = %.1f FPS",
+            pvfb->state->renderedFrames, ((float) pvfb->state->renderedFrames) / 5);
+    pvfb->state->renderedFrames = 0;
+    return 5000;
+}
+
+static CARD32 lorieHeartbeat(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    lorieSendHeartbeat();
+    return 1000;
+}
+
+static PixmapPtr lorieCreateRootPixmap(ScreenPtr pScreen, int width, int height) {
+    return pScreen->CreatePixmap(pScreen, width, height, pScreen->rootDepth, CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED);
+}
+
+static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
+    pScreen->devPrivate = lorieCreateRootPixmap(pScreen, pScreen->width, pScreen->height);
+
+    pvfb->damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, NULL);
+    if (!pvfb->damage)
+        FatalError("Couldn't setup damage\n");
+
+    DamageRegister(&(*pScreen->GetScreenPixmap)(pScreen)->drawable, pvfb->damage);
+    pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
+    TimerSet(NULL, 0, 1000, lorieHeartbeat, NULL);
+    RegisterBlockAndWakeupHandlers(lorieBlockHandler, (ServerWakeupHandlerProcPtr) NoopDDA, NULL);
+
+    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+
+    return TRUE;
+}
+
+static Bool lorieCloseScreen(ScreenPtr pScreen) {
+    pScreenPtr = NULL;
+    pScreen->DestroyPixmap(pScreen->devPrivate);
+    pScreen->devPrivate = NULL;
+    pScreen->CloseScreen = pvfb->CloseScreen;
+    return pScreen->CloseScreen(pScreen);
+}
+
+void lorieSetWindowPixmap(WindowPtr pWindow, PixmapPtr newPixmap) {
+    bool isRoot = pWindow == pScreenPtr->root;
+    PixmapPtr oldPixmap = isRoot ? pScreenPtr->GetWindowPixmap(pWindow) : NULL;
+    LoriePixmapPriv *old, *new;
+    if (isRoot) {
+        old = LORIE_PIXMAP_PRIV_FROM_PIXMAP(oldPixmap);
+        new = LORIE_PIXMAP_PRIV_FROM_PIXMAP(newPixmap);
+        if (old && old->buffer && old->locked) {
+            LorieBuffer_unlock(old->buffer);
+            old->locked = NULL;
+            old->wasLocked = false;
+        }
+        if (new && new->buffer && !new->locked) {
+            LorieBuffer_lock(new->buffer, &new->locked);
+            new->wasLocked = false;
+        }
+    }
+
+    pScreenPtr->SetWindowPixmap = pvfb->SetWindowPixmap;
+    (*pScreenPtr->SetWindowPixmap) (pWindow, newPixmap);
+    pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
+    pScreenPtr->SetWindowPixmap = lorieSetWindowPixmap;
+}
+
+static int lorieSetPixmapVisitWindow(WindowPtr window, void *data) {
+    ScreenPtr screen = window->drawable.pScreen;
+
+    if (screen->GetWindowPixmap(window) == data) {
+        screen->SetWindowPixmap(window, screen->GetScreenPixmap(screen));
+        return WT_WALKCHILDREN;
+    }
+
+    return WT_DONTWALKCHILDREN;
+}
+
+static Bool lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height, unused CARD32 mmWidth, unused CARD32 mmHeight) {
+    PixmapPtr oldPixmap, newPixmap;
+    BoxRec box = { 0, 0, width, height };
+
+    // Drain all pending vblanks.
+    loriePerformVblanks();
+
+    // Restore root window pixmap.
+    present_restore_screen_pixmap(pScreenPtr);
+
+    SetRootClip(pScreen, ROOT_CLIP_NONE);
+
+    pScreen->root->drawable.width = pvfb->root.width = pScreen->width = width;
+    pScreen->root->drawable.height = pvfb->root.height = pScreen->height = height;
+    pScreen->mmWidth = ((double) (width)) * 25.4 / monitorResolution;
+    pScreen->mmHeight = ((double) (height)) * 25.4 / monitorResolution;
+
+    oldPixmap = pScreen->GetScreenPixmap(pScreen);
+    newPixmap = lorieCreateRootPixmap(pScreen, width, height);
+    pScreen->SetScreenPixmap(newPixmap);
+    if (pvfb->damage) {
+        DamageUnregister(pvfb->damage);
+        DamageDestroy(pvfb->damage);
+    }
+
+    pvfb->damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, NULL);
+    if (!pvfb->damage)
+        FatalError("Couldn't setup damage\n");
+
+    DamageRegister(&newPixmap->drawable, pvfb->damage);
+
+    if (oldPixmap) {
+        GCPtr gc = GetScratchGC(newPixmap->drawable.depth, pScreen);
+        if (gc) {
+            ValidateGC(&newPixmap->drawable, gc);
+            gc->ops->CopyArea(&oldPixmap->drawable, &newPixmap->drawable, gc, 0, 0, min(oldPixmap->drawable.width, newPixmap->drawable.width), min(oldPixmap->drawable.height, newPixmap->drawable.height), 0, 0);
+            FreeScratchGC(gc);
+        }
+        TraverseTree(pScreen->root, lorieSetPixmapVisitWindow, oldPixmap);
+        pScreen->DestroyPixmap(oldPixmap);
+    }
+
+    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+
+    pScreen->ResizeWindow(pScreen->root, 0, 0, width, height, NULL);
+    RegionReset(&pScreen->root->winSize, &box);
+
+    SetRootClip(pScreen, ROOT_CLIP_FULL);
+
+    RRScreenSizeNotify(pScreen);
+    update_desktop_dimensions();
+    pvfb->state->cursor.moved = TRUE;
+
+    return TRUE;
+}
+
+static Bool lorieRRCrtcSet(unused ScreenPtr pScreen, RRCrtcPtr crtc, RRModePtr mode, int x, int y,
+               Rotation rotation, int numOutput, RROutputPtr *outputs) {
+    return (crtc && mode) ? RRCrtcNotify(crtc, mode, x, y, rotation, NULL, numOutput, outputs) : FALSE;
+}
+
+static Bool lorieRRGetInfo(unused ScreenPtr pScreen, Rotation *rotations) {
+    *rotations = RR_Rotate_0;
+    return TRUE;
+}
+
+static Bool lorieRandRInit(ScreenPtr pScreen) {
+    rrScrPrivPtr pScrPriv;
+    RROutputPtr output;
+    RRCrtcPtr crtc;
+    RRModePtr mode;
+
+    if (!RRScreenInit(pScreen))
+       return FALSE;
+
+    pScrPriv = rrGetScrPriv(pScreen);
+    pScrPriv->rrGetInfo = lorieRRGetInfo;
+    pScrPriv->rrCrtcSet = lorieRRCrtcSet;
+    pScrPriv->rrScreenSetSize = lorieRRScreenSetSize;
+
+    RRScreenSetSizeRange(pScreen, 1, 1, 32767, 32767);
+
+    if (FALSE
+        || !(mode = lorieCvt(pScreen->width, pScreen->height, pvfb->root.framerate))
+        || !(crtc = RRCrtcCreate(pScreen, NULL))
+        || !RRCrtcGammaSetSize(crtc, 256)
+        || !(output = RROutputCreate(pScreen, pvfb->root.name, sizeof(pvfb->root.name), NULL))
+        || (output->nameLength = strlen(output->name), FalseNoop())
+        || !RROutputSetClones(output, NULL, 0)
+        || !RROutputSetModes(output, &mode, 1, 0)
+        || !RROutputSetCrtcs(output, &crtc, 1)
+        || !RROutputSetConnection(output, RR_Connected)
+        || !RRCrtcNotify(crtc, mode, 0, 0, RR_Rotate_0, NULL, 1, &output))
+        return FALSE;
+    return TRUE;
+}
+
+void lorieWakeServer(void) {
+    // Wake the server if it sleeps.
+    eventfd_write(pvfb->eventFd, 1);
+}
+
+static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused *data) {
+    // Nothing to do here. It is needed to interrupt ospoll_wait.
+    eventfd_t dummy;
+    eventfd_read(fd, &dummy);
+}
+
+void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+    AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+    if (pScreenPtr) {
+        QueueWorkProc(lorieRedraw, NULL, NULL);
+        lorieWakeServer();
+    }
+}
+
+static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
+    static int eventFd = -1;
+    pScreenPtr = pScreen;
+
+    if (eventFd == -1)
+        eventFd = eventfd(0, EFD_CLOEXEC);
+
+    pvfb->eventFd = eventFd;
+    SetNotifyFd(eventFd, lorieWorkingQueueCallback, X_NOTIFY_READ, NULL);
+
+    miSetZeroLineBias(pScreen, 0);
+    pScreen->blackPixel = 0;
+    pScreen->whitePixel = 1;
+
+    pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+
+    if (FALSE
+          || !miSetVisualTypesAndMasks(24, ((1 << TrueColor) | (1 << DirectColor)), 8, TrueColor, 0xFF0000, 0x00FF00, 0x0000FF)
+          || !miSetPixmapDepths()
+          || !fbScreenInit(pScreen, NULL, pvfb->root.width, pvfb->root.height, monitorResolution, monitorResolution, 0, 32)
+          || !(pScreen->CreateScreenResources = lorieCreateScreenResources) // Simply replace unneeded function
+          || !(!pvfb->dri3 || dri3_screen_init(pScreen, &lorieDri3Info))
+          || !fbPictureInit(pScreen, 0, 0)
+          || !exaDriverInit(pScreen, &lorieExa)
+          || !lorieRandRInit(pScreen)
+          || !miPointerInitialize(pScreen, &loriePointerSpriteFuncs, &loriePointerCursorFuncs, TRUE)
+          || !fbCreateDefColormap(pScreen)
+          || !present_screen_init(pScreen, &loriePresentInfo))
+        return FALSE;
+
+    pvfb->CloseScreen = pScreen->CloseScreen;
+    pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
+    pScreen->CloseScreen = lorieCloseScreen;
+    pScreen->SetWindowPixmap = lorieSetWindowPixmap;
+
+    ShmRegisterFbFuncs(pScreen);
+    miSyncShmScreenInit(pScreen);
+
+    return TRUE;
+}                               /* end lorieScreenInit */
+
+void lorieConfigureNotify(int width, int height, int framerate, size_t name_size, char* name) {
+    ScreenPtr pScreen = pScreenPtr;
+    RROutputPtr output = RRFirstOutput(pScreen);
+    framerate = framerate ? framerate : 30;
+
+    if (output && name) {
+        // We should save this name in pvfb to make sure the name will be restored in the case if the server is being reset.
+        memset(pvfb->root.name, 0, 1024);
+        memset(output->name, 0, 1024);
+        strncpy(pvfb->root.name, name, name_size < 1024 ? name_size : 1024);
+        strncpy(output->name, name, name_size < 1024 ? name_size : 1024);
+        output->name[1023] = '\0';
+        output->nameLength = strlen(output->name);
+    }
+
+    if (output && width && height && (pScreen->width != width || pScreen->height != height || pvfb->root.framerate != framerate)) {
+        CARD32 mmWidth, mmHeight;
+        RRModePtr mode = lorieCvt(width, height, framerate);
+        mmWidth = ((double) (mode->mode.width)) * 25.4 / monitorResolution;
+        mmHeight = ((double) (mode->mode.width)) * 25.4 / monitorResolution;
+        RROutputSetModes(output, &mode, 1, 0);
+        RRCrtcNotify(RRFirstEnabledCrtc(pScreen), mode, 0, 0, RR_Rotate_0, NULL, 1, &output);
+        RRScreenSizeSet(pScreen, mode->mode.width, mode->mode.height, mmWidth, mmHeight);
+
+        log(VERBOSE, "New reported framerate is %d", framerate);
+        pvfb->root.framerate = framerate;
+        pvfb->vblank_interval = 1000000 / pvfb->root.framerate;
+    }
+}
+
+void InitOutput(ScreenInfo * screen_info, int argc, char **argv) {
+    int depths[] = { 1, 4, 8, 15, 16, 24, 32 };
+    int bpp[] =    { 1, 8, 8, 16, 16, 32, 32 };
+    int i;
+
+    if (monitorResolution == 0)
+        monitorResolution = 96;
+
+    for(i = 0; i < ARRAY_SIZE(depths); i++) {
+        screen_info->formats[i].depth = depths[i];
+        screen_info->formats[i].bitsPerPixel = bpp[i];
+        screen_info->formats[i].scanlinePad = BITMAP_SCANLINE_PAD;
+    }
+
+    screen_info->imageByteOrder = IMAGE_BYTE_ORDER;
+    screen_info->bitmapScanlineUnit = BITMAP_SCANLINE_UNIT;
+    screen_info->bitmapScanlinePad = BITMAP_SCANLINE_PAD;
+    screen_info->bitmapBitOrder = BITMAP_BIT_ORDER;
+    screen_info->numPixmapFormats = ARRAY_SIZE(depths);
+
+    rendererTestCapabilities(&pvfb->root.legacyDrawing, &pvfb->rendererRelock);
+    xorgGlxCreateVendor();
+    lorieInitClipboard();
+
+    if (-1 == AddScreen(lorieScreenInit, argc, argv)) {
+        FatalError("Couldn't add screen\n");
+    }
+}
+
+// This Present implementation mostly copies the one from `present/present_fake.c`
+// The only difference is performing vblanks right before redrawing root window (in lorieRedraw) instead of using timers.
+static RRCrtcPtr loriePresentGetCrtc(WindowPtr w) {
+    return RRFirstEnabledCrtc(w->drawable.pScreen);
+}
+
+static int loriePresentGetUstMsc(__unused RRCrtcPtr crtc, uint64_t *ust, uint64_t *msc) {
+    *ust = GetTimeInMicros();
+    *msc = pvfb->current_msc;
     return Success;
 }
 
-static Bool
-lorieInitPointerButtons(DeviceIntPtr device) {
-#define NBUTTONS 10
-    BYTE map[NBUTTONS + 1];
-    int i;
-    Atom btn_labels[NBUTTONS] = { 0 };
+static Bool loriePresentQueueVblank(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t msc) {
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "MemoryLeak" // it is not leaked, it is destroyed in lorieRedraw
+    struct vblank* vblank = calloc (1, sizeof (*vblank));
+    if (!vblank)
+        return BadAlloc;
 
-    for (i = 1; i <= NBUTTONS; i++)
-        map[i] = i;
+    *vblank = (struct vblank) { .id = event_id, .msc = msc };
+    xorg_list_add(&vblank->link, &pvfb->vblank_queue);
 
-    btn_labels[0] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_LEFT);
-    btn_labels[1] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_MIDDLE);
-    btn_labels[2] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_RIGHT);
-    btn_labels[3] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_WHEEL_UP);
-    btn_labels[4] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_WHEEL_DOWN);
-    btn_labels[5] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_HWHEEL_LEFT);
-    btn_labels[6] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_HWHEEL_RIGHT);
-    /* don't know about the rest */
+    return Success;
+#pragma clang diagnostic pop
+}
 
-    if (!InitButtonClassDeviceStruct(device, NBUTTONS, btn_labels, map))
+static void loriePresentAbortVblank(__unused RRCrtcPtr crtc, uint64_t id, __unused uint64_t msc) {
+    struct vblank *vblank, *tmp;
+
+    xorg_list_for_each_entry_safe(vblank, tmp, &pvfb->vblank_queue, link) {
+        if (vblank->id == id) {
+            xorg_list_del(&vblank->link);
+            free (vblank);
+            break;
+        }
+    }
+}
+
+static void loriePerformVblanks(void) {
+    struct vblank *vblank, *tmp;
+    xorg_list_for_each_entry_safe(vblank, tmp, &pvfb->vblank_queue, link) {
+        if (vblank->msc <= pvfb->current_msc) {
+            present_event_notify(vblank->id, GetTimeInMicros(), pvfb->current_msc);
+            xorg_list_del(&vblank->link);
+            free (vblank);
+        }
+    }
+}
+
+Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
+    LoriePixmapPriv* priv = (LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap);
+    if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height)
         return FALSE;
 
+    // Escape hatch: with TERMUX_X11_NO_FLIP=1 Present always copies into the root pixmap (under the request lock)
+    // instead of handing the client's buffer to the renderer.
+    char *noFlip = getenv("TERMUX_X11_NO_FLIP");
+    if (noFlip && strcmp(noFlip, "1") == 0)
+        return FALSE;
+
+    const LorieBuffer_Desc *desc = LorieBuffer_description(priv->buffer);
+    char *forceFlip = getenv("TERMUX_X11_FORCE_FLIP");
+    if (desc->type == LORIEBUFFER_FD && priv->imported && !(forceFlip && strcmp(forceFlip, "1") == 0))
+        return FALSE; // For some reason it does not work fine with turnip.
+
+    // Regular buffers can not be shared to activity, we must explicitly convert LorieBuffer to FD or AHardwareBuffer
+    lorieEnsureGpuSampleable(pixmap, pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER);
+
+    if (desc->type != LORIEBUFFER_FD && desc->type != LORIEBUFFER_AHARDWAREBUFFER)
+        return FALSE;
+
+    lorieRegisterBuffer(priv->buffer);
     return TRUE;
-#undef NBUTTONS
 }
 
-__unused static int
-lorieMouseProc(DeviceIntPtr device, int what) {
-#define NAXES 4
-    Atom axes_labels[NAXES] = { 0 };
-
-    switch (what) {
-        case DEVICE_INIT:
-            device->public.on = FALSE;
-
-            axes_labels[0] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_X);
-            axes_labels[1] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_Y);
-            axes_labels[2] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_HWHEEL);
-            axes_labels[3] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_WHEEL);
-
-            if (!lorieInitPointerButtons(device)
-            ||  !InitValuatorClassDeviceStruct(device, NAXES, axes_labels, GetMotionHistorySize(), Relative)
-            ||  !InitValuatorAxisStruct(device, 0, axes_labels[0], NO_AXIS_LIMITS, NO_AXIS_LIMITS, 0, 0, 0, Relative)
-            ||  !InitValuatorAxisStruct(device, 1, axes_labels[1], NO_AXIS_LIMITS, NO_AXIS_LIMITS, 0, 0, 0, Relative)
-            ||  !InitValuatorAxisStruct(device, 2, axes_labels[2], NO_AXIS_LIMITS, NO_AXIS_LIMITS, 0, 0, 0, Relative)
-            ||  !InitValuatorAxisStruct(device, 3, axes_labels[3], NO_AXIS_LIMITS, NO_AXIS_LIMITS, 0, 0, 0, Relative)
-            ||  !SetScrollValuator(device, 2, SCROLL_TYPE_HORIZONTAL, 1.0, SCROLL_FLAG_NONE)
-            ||  !SetScrollValuator(device, 3, SCROLL_TYPE_VERTICAL, 1.0, SCROLL_FLAG_PREFERRED)
-            ||  !InitPtrFeedbackClassDeviceStruct(device, (PtrCtrlProcPtr) NoopDDA)
-            ||  !InitPointerAccelerationScheme(device, PtrAccelPredictable))
-                return BadValue;
-
-            return Success;
-
-        case DEVICE_ON:
-            device->public.on = TRUE;
-            return Success;
-
-        case DEVICE_OFF:
-        case DEVICE_CLOSE:
-            device->public.on = FALSE;
-            return Success;
-        default:
-            return BadMatch;
-    }
-#undef NAXES
+void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t ust, uint64_t target_msc, __unused PixmapPtr pixmap) {
+    // X server was patched to call this function right after finishing all present_flip shenanigans
+    // Since we do not invoke DRM API or anything similar we do not need to implement this as callback
+    // For some reason calling present_event_notify in BlockHandler or as QueueWorkProc/eventfd callback
+    // adds some delay which may be easily avoided this way.
+    static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
+    RegionReset(DamageRegion(pvfb->damage), &box);
+    pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
+    present_event_notify(event_id, ust, pvfb->current_msc);
 }
 
-static int
-lorieTouchProc(DeviceIntPtr device, int what) {
-#define NTOUCHPOINTS 20
-#define NBUTTONS 1
-#define NAXES 2
-    Atom btn_labels[NBUTTONS] = { 0 };
-    BYTE map[NBUTTONS + 1] = { 0 };
-    Atom axes_labels[NAXES] = { 0 };
-
-    switch (what) {
-        case DEVICE_INIT:
-            device->public.on = FALSE;
-
-            map[0] = 1;
-            btn_labels[0] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_LEFT);
-            axes_labels[0] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_POSITION_X);
-            axes_labels[1] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_POSITION_Y);
-
-            if (!InitValuatorClassDeviceStruct(device, NAXES, axes_labels, GetMotionHistorySize(), Absolute)
-            ||  !InitButtonClassDeviceStruct(device, NBUTTONS, btn_labels, map)
-            ||  !InitTouchClassDeviceStruct(device, NTOUCHPOINTS, XIDirectTouch, NAXES)
-            ||  !InitValuatorAxisStruct(device, 0, axes_labels[0], 0, 0xFFFF, 10000, 0, 10000, Absolute)
-            ||  !InitValuatorAxisStruct(device, 1, axes_labels[1], 0, 0xFFFF, 10000, 0, 10000, Absolute))
-                return BadValue;
-
-            return Success;
-
-        case DEVICE_ON:
-            device->public.on = TRUE;
-            return Success;
-
-        case DEVICE_OFF:
-        case DEVICE_CLOSE:
-            device->public.on = FALSE;
-            return Success;
-        default:
-            return BadMatch;
-    }
-#undef NAXES
-#undef NBUTTONS
-#undef NTOUCHPOINTS
+void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
+    present_event_notify(event_id, 0, 0);
 }
 
-static int
-lorieStylusProc(DeviceIntPtr device, int what) {
-#define NBUTTONS 3
-#define NAXES 6
-    Atom btn_labels[NBUTTONS] = { 0 };
-    Atom axes_labels[NAXES] = { 0 };
-    BYTE map[NBUTTONS + 1] = { 0 };
-    int i;
-
-    switch (what) {
-        case DEVICE_INIT:
-            device->public.on = FALSE;
-
-            for (i = 1; i <= NBUTTONS; i++)
-                map[i] = i;
-
-            axes_labels[0] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_X);
-            axes_labels[1] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_Y);
-            axes_labels[2] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_PRESSURE);
-            axes_labels[3] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_TILT_X);
-            axes_labels[4] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_TILT_Y);
-            axes_labels[5] = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_WHEEL);
-
-            /* Valuators - match the xf86-input-wacom ranges */
-            if (!InitValuatorClassDeviceStruct(device, NAXES, axes_labels, GetMotionHistorySize(), Absolute)
-                || !InitValuatorAxisStruct(device, 0, axes_labels[0], 0, 0x3FFFF, 10000, 0, 10000, Absolute)
-                || !InitValuatorAxisStruct(device, 1, axes_labels[1], 0, 0x3FFFF, 10000, 0, 10000, Absolute)
-                || !InitValuatorAxisStruct(device, 2, axes_labels[2], 0, 0xFFFF, 1, 0, 1, Absolute) // pressure
-                || !InitValuatorAxisStruct(device, 3, axes_labels[3], -64, 63, 57, 0, 57, Absolute) // tilt x
-                || !InitValuatorAxisStruct(device, 4, axes_labels[4], -64, 63, 57, 0, 57, Absolute) // tilt y
-                || !InitValuatorAxisStruct(device, 5, axes_labels[5], -900, 899, 1, 0, 1, Absolute) // abs wheel (airbrush) or rotation (artpen)
-                || !InitPtrFeedbackClassDeviceStruct(device, (PtrCtrlProcPtr) NoopDDA)
-                || !InitButtonClassDeviceStruct(device, NBUTTONS, btn_labels, map))
-                return BadValue;
-
-            return Success;
-
-        case DEVICE_ON:
-            device->public.on = TRUE;
-            return Success;
-
-        case DEVICE_OFF:
-        case DEVICE_CLOSE:
-            device->public.on = FALSE;
-            return Success;
-    }
-
-    return BadMatch;
-#undef NAXES
-#undef NBUTTONS
-}
-
-void
-lorieSetStylusEnabled(Bool enabled) {
-    __android_log_print(ANDROID_LOG_DEBUG, "LorieNative", "Requested stylus: %d, current loriePen %p, current lorieEraser %p\n", enabled, loriePen, lorieEraser);
-    if (enabled) {
-        if (loriePen == NULL) {
-            loriePen = AddInputDevice(serverClient, lorieStylusProc, TRUE);
-            AssignTypeAndName(loriePen, MakeAtom(XI_PEN, sizeof(XI_PEN) - 1, TRUE), "Lorie pen");
-            ActivateDevice(loriePen, FALSE);
-            EnableDevice(loriePen, TRUE);
-            AttachDevice(NULL, loriePen, inputInfo.pointer);
-        }
-        if (lorieEraser == NULL) {
-            lorieEraser = AddInputDevice(serverClient, lorieStylusProc, TRUE);
-            AssignTypeAndName(lorieEraser, MakeAtom(XI_ERASER, sizeof(XI_ERASER) - 1, TRUE), "Lorie eraser");
-            ActivateDevice(lorieEraser, FALSE);
-            EnableDevice(lorieEraser, TRUE);
-            AttachDevice(NULL, lorieEraser, inputInfo.pointer);
-        }
-    } else {
-        if (loriePen != NULL) {
-            RemoveDevice(loriePen, TRUE);
-            loriePen = NULL;
-        }
-        if (lorieEraser != NULL) {
-            RemoveDevice(lorieEraser, TRUE);
-            lorieEraser = NULL;
-        }
-    }
-}
-
-void
-InitInput(__unused int argc, __unused char *argv[]) {
-    lorieMouse = AddInputDevice(serverClient, lorieMouseProc, TRUE);
-    lorieTouch = AddInputDevice(serverClient, lorieTouchProc, TRUE);
-    lorieKeyboard = AddInputDevice(serverClient, lorieKeybdProc, TRUE);
-    AssignTypeAndName(lorieMouse, MakeAtom(XI_MOUSE, sizeof(XI_MOUSE) - 1, TRUE), "Lorie mouse");
-    AssignTypeAndName(lorieTouch, MakeAtom(XI_TOUCHSCREEN, sizeof(XI_TOUCHSCREEN) - 1, TRUE), "Lorie touch");
-    AssignTypeAndName(lorieKeyboard, MakeAtom(XI_KEYBOARD, sizeof(XI_KEYBOARD) - 1, TRUE), "Lorie keyboard");
-    ActivateDevice(lorieMouse, FALSE);
-    ActivateDevice(lorieTouch, FALSE);
-    ActivateDevice(lorieKeyboard, FALSE);
-    EnableDevice(lorieMouse, TRUE);
-    EnableDevice(lorieTouch, TRUE);
-    EnableDevice(lorieKeyboard, TRUE);
-    AttachDevice(NULL, lorieMouse, inputInfo.pointer);
-    AttachDevice(NULL, lorieTouch, inputInfo.pointer);
-    AttachDevice(NULL, lorieKeyboard, inputInfo.keyboard);
-
-    // We should explicitly create stylus pen and eraser devices here for the case of X server reset.
-    if (loriePen && lorieEraser) {
-        loriePen = lorieEraser = NULL;
-        lorieSetStylusEnabled(true);
-    }
-
-    (void) mieqInit();
-}
-
-void
-CloseInput(void) {
-    mieqFini();
-}
-
-#define _EVDEVK(_v) (0x10081000 + (_v)) // XF86keysym.h undefines it at the end.
-
-const lorieExtendedKey lorieExtendedKeys[] = {
-    { 0x0f8  /* KEY_MICMUTE */, XF86XK_AudioMicMute },
-    { 0x160  /* KEY_OK */, XF86XK_OK },
-    { 0x161  /* KEY_SELECT */, XF86XK_Select },
-    { 0x162  /* KEY_GOTO */, XF86XK_GoTo },
-    { 0x163  /* KEY_CLEAR */, XF86XK_Clear },
-    { 0x165  /* KEY_OPTION */, XF86XK_Option },
-    { 0x166  /* KEY_INFO */, XF86XK_Info },
-    { 0x167  /* KEY_TIME */, XF86XK_Time },
-    { 0x168  /* KEY_VENDOR */, XF86XK_VendorLogo },
-    { 0x16a  /* KEY_PROGRAM */, XF86XK_MediaSelectProgramGuide },
-    { 0x16b  /* KEY_CHANNEL */, XF86XK_NextFavorite },
-    { 0x16c  /* KEY_FAVORITES */, XF86XK_Favorites },
-    { 0x16d  /* KEY_EPG */, XF86XK_MediaSelectProgramGuide },
-    { 0x16e  /* KEY_PVR */, XF86XK_MediaSelectHome },
-    { 0x170  /* KEY_LANGUAGE */, XF86XK_MediaLanguageMenu },
-    { 0x171  /* KEY_TITLE */, XF86XK_MediaTitleMenu },
-    { 0x172  /* KEY_SUBTITLE */, XF86XK_Subtitle },
-    { 0x173  /* KEY_ANGLE */, XF86XK_CycleAngle },
-    { 0x174  /* KEY_FULL_SCREEN */, XF86XK_FullScreen },
-    { 0x175  /* KEY_MODE */, XF86XK_AudioChannelMode },
-    { 0x176  /* KEY_KEYBOARD */, XF86XK_Keyboard },
-    { 0x177  /* KEY_ASPECT_RATIO */, XF86XK_AspectRatio },
-    { 0x178  /* KEY_PC */, XF86XK_MediaSelectPC },
-    { 0x179  /* KEY_TV */, XF86XK_MediaSelectTV },
-    { 0x17a  /* KEY_TV2 */, XF86XK_MediaSelectCable },
-    { 0x17b  /* KEY_VCR */, XF86XK_MediaSelectVCR },
-    { 0x17c  /* KEY_VCR2 */, XF86XK_MediaSelectVCRPlus },
-    { 0x17d  /* KEY_SAT */, XF86XK_MediaSelectSatellite },
-    { 0x17f  /* KEY_CD */, XF86XK_MediaSelectCD },
-    { 0x180  /* KEY_TAPE */, XF86XK_MediaSelectTape },
-    { 0x181  /* KEY_RADIO */, XF86XK_MediaSelectRadio },
-    { 0x182  /* KEY_TUNER */, XF86XK_MediaSelectTuner },
-    { 0x183  /* KEY_PLAYER */, XF86XK_MediaPlayer },
-    { 0x184  /* KEY_TEXT */, XF86XK_MediaSelectTeletext },
-    { 0x185  /* KEY_DVD */, XF86XK_DVD },
-    { 0x186  /* KEY_AUX */, XF86XK_MediaSelectAuxiliary },
-    { 0x188  /* KEY_AUDIO */, XF86XK_Audio },
-    { 0x189  /* KEY_VIDEO */, XF86XK_Video },
-    { 0x18c  /* KEY_MEMO */, XF86XK_Memo },
-    { 0x18d  /* KEY_CALENDAR */, XF86XK_Calendar },
-    { 0x18e  /* KEY_RED */, XF86XK_Red },
-    { 0x18f  /* KEY_GREEN */, XF86XK_Green },
-    { 0x190  /* KEY_YELLOW */, XF86XK_Yellow },
-    { 0x191  /* KEY_BLUE */, XF86XK_Blue },
-    { 0x192  /* KEY_CHANNELUP */, XF86XK_ChannelUp },
-    { 0x193  /* KEY_CHANNELDOWN */, XF86XK_ChannelDown },
-    { 0x199  /* KEY_SLOW */, XF86XK_MediaPlaySlow },
-    { 0x19a  /* KEY_SHUFFLE */, XF86XK_AudioRandomPlay },
-    { 0x19b  /* KEY_BREAK */, XF86XK_Break },
-    { 0x19d  /* KEY_DIGITS */, XF86XK_NumberEntryMode },
-    { 0x1a0  /* KEY_VIDEOPHONE */, XF86XK_VideoPhone },
-    { 0x1a1  /* KEY_GAMES */, XF86XK_Game },
-    { 0x1a2  /* KEY_ZOOMIN */, XF86XK_ZoomIn },
-    { 0x1a3  /* KEY_ZOOMOUT */, XF86XK_ZoomOut },
-    { 0x1a4  /* KEY_ZOOMRESET */, XF86XK_ZoomReset },
-    { 0x1a5  /* KEY_WORDPROCESSOR */, XF86XK_Word },
-    { 0x1a6  /* KEY_EDITOR */, XF86XK_Editor },
-    { 0x1a7  /* KEY_SPREADSHEET */, XF86XK_Excel },
-    { 0x1a8  /* KEY_GRAPHICSEDITOR */, XF86XK_GraphicsEditor },
-    { 0x1a9  /* KEY_PRESENTATION */, XF86XK_Presentation },
-    { 0x1aa  /* KEY_DATABASE */, XF86XK_Database },
-    { 0x1ab  /* KEY_NEWS */, XF86XK_News },
-    { 0x1ac  /* KEY_VOICEMAIL */, XF86XK_Voicemail },
-    { 0x1ad  /* KEY_ADDRESSBOOK */, XF86XK_Addressbook },
-    { 0x1ae  /* KEY_MESSENGER */, XF86XK_Messenger },
-    { 0x1af  /* KEY_DISPLAYTOGGLE */, XF86XK_DisplayToggle },
-    { 0x1b0  /* KEY_SPELLCHECK */, XF86XK_SpellCheck },
-    { 0x1b1  /* KEY_LOGOFF */, XF86XK_LogOff },
-    { 0x1b4  /* KEY_FRAMEBACK */, XF86XK_FrameBack },
-    { 0x1b5  /* KEY_FRAMEFORWARD */, XF86XK_FrameForward },
-    { 0x1b6  /* KEY_CONTEXT_MENU */, XF86XK_ContextMenu },
-    { 0x1b7  /* KEY_MEDIA_REPEAT */, XF86XK_MediaRepeat },
-    { 0x1b8  /* KEY_10CHANNELSUP */, XF86XK_10ChannelsUp },
-    { 0x1b9  /* KEY_10CHANNELSDOWN */, XF86XK_10ChannelsDown },
-    { 0x1ba  /* KEY_IMAGES */, XF86XK_Images },
-    { 0x1bc  /* KEY_NOTIFICATION_CENTER */, XF86XK_NotificationCenter },
-    { 0x1bd  /* KEY_PICKUP_PHONE */, XF86XK_PickupPhone },
-    { 0x1be  /* KEY_HANGUP_PHONE */, XF86XK_HangupPhone },
-    { 0x1bf  /* KEY_LINK_PHONE */, XF86XK_LinkPhone },
-    { 0x1d0  /* KEY_FN */, XF86XK_Fn },
-    { 0x1d1  /* KEY_FN_ESC */, XF86XK_Fn_Esc },
-    { 0x1d2  /* KEY_FN_F1 */, XF86XK_Fn_F1 },
-    { 0x1d3  /* KEY_FN_F2 */, XF86XK_Fn_F2 },
-    { 0x1d4  /* KEY_FN_F3 */, XF86XK_Fn_F3 },
-    { 0x1d5  /* KEY_FN_F4 */, XF86XK_Fn_F4 },
-    { 0x1d6  /* KEY_FN_F5 */, XF86XK_Fn_F5 },
-    { 0x1d7  /* KEY_FN_F6 */, XF86XK_Fn_F6 },
-    { 0x1d8  /* KEY_FN_F7 */, XF86XK_Fn_F7 },
-    { 0x1d9  /* KEY_FN_F8 */, XF86XK_Fn_F8 },
-    { 0x1da  /* KEY_FN_F9 */, XF86XK_Fn_F9 },
-    { 0x1db  /* KEY_FN_F10 */, XF86XK_Fn_F10 },
-    { 0x1dc  /* KEY_FN_F11 */, XF86XK_Fn_F11 },
-    { 0x1dd  /* KEY_FN_F12 */, XF86XK_Fn_F12 },
-    { 0x1de  /* KEY_FN_1 */, XF86XK_Fn_1 },
-    { 0x1df  /* KEY_FN_2 */, XF86XK_Fn_2 },
-    { 0x1e0  /* KEY_FN_D */, XF86XK_Fn_D },
-    { 0x1e1  /* KEY_FN_E */, XF86XK_Fn_E },
-    { 0x1e2  /* KEY_FN_F */, XF86XK_Fn_F },
-    { 0x1e3  /* KEY_FN_S */, XF86XK_Fn_S },
-    { 0x1e4  /* KEY_FN_B */, XF86XK_Fn_B },
-    { 0x1e5  /* KEY_FN_RIGHT_SHIFT */, XF86XK_FnRightShift },
-    { 0x200  /* KEY_NUMERIC_0 */, XF86XK_Numeric0 },
-    { 0x201  /* KEY_NUMERIC_1 */, XF86XK_Numeric1 },
-    { 0x202  /* KEY_NUMERIC_2 */, XF86XK_Numeric2 },
-    { 0x203  /* KEY_NUMERIC_3 */, XF86XK_Numeric3 },
-    { 0x204  /* KEY_NUMERIC_4 */, XF86XK_Numeric4 },
-    { 0x205  /* KEY_NUMERIC_5 */, XF86XK_Numeric5 },
-    { 0x206  /* KEY_NUMERIC_6 */, XF86XK_Numeric6 },
-    { 0x207  /* KEY_NUMERIC_7 */, XF86XK_Numeric7 },
-    { 0x208  /* KEY_NUMERIC_8 */, XF86XK_Numeric8 },
-    { 0x209  /* KEY_NUMERIC_9 */, XF86XK_Numeric9 },
-    { 0x20a  /* KEY_NUMERIC_STAR */, XF86XK_NumericStar },
-    { 0x20b  /* KEY_NUMERIC_POUND */, XF86XK_NumericPound },
-    { 0x20c  /* KEY_NUMERIC_A */, XF86XK_NumericA },
-    { 0x20d  /* KEY_NUMERIC_B */, XF86XK_NumericB },
-    { 0x20e  /* KEY_NUMERIC_C */, XF86XK_NumericC },
-    { 0x20f  /* KEY_NUMERIC_D */, XF86XK_NumericD },
-    { 0x210  /* KEY_CAMERA_FOCUS */, XF86XK_CameraFocus },
-    { 0x211  /* KEY_WPS_BUTTON */, XF86XK_WPSButton },
-    { 0x212  /* KEY_TOUCHPAD_TOGGLE */, XF86XK_TouchpadToggle },
-    { 0x213  /* KEY_TOUCHPAD_ON */, XF86XK_TouchpadOn },
-    { 0x214  /* KEY_TOUCHPAD_OFF */, XF86XK_TouchpadOff },
-    { 0x215  /* KEY_CAMERA_ZOOMIN */, XF86XK_CameraZoomIn },
-    { 0x216  /* KEY_CAMERA_ZOOMOUT */, XF86XK_CameraZoomOut },
-    { 0x217  /* KEY_CAMERA_UP */, XF86XK_CameraUp },
-    { 0x218  /* KEY_CAMERA_DOWN */, XF86XK_CameraDown },
-    { 0x219  /* KEY_CAMERA_LEFT */, XF86XK_CameraLeft },
-    { 0x21a  /* KEY_CAMERA_RIGHT */, XF86XK_CameraRight },
-    { 0x21b  /* KEY_ATTENDANT_ON */, XF86XK_AttendantOn },
-    { 0x21c  /* KEY_ATTENDANT_OFF */, XF86XK_AttendantOff },
-    { 0x21d  /* KEY_ATTENDANT_TOGGLE */, XF86XK_AttendantToggle },
-    { 0x21e  /* KEY_LIGHTS_TOGGLE */, XF86XK_LightsToggle },
-    { 0x230  /* KEY_ALS_TOGGLE */, XF86XK_ALSToggle },
-    { 0x231  /* KEY_ROTATE_LOCK_TOGGLE */, XF86XK_RotationLockToggle },
-    { 0x232  /* KEY_REFRESH_RATE_TOGGLE */, XF86XK_RefreshRateToggle },
-    { 0x240  /* KEY_BUTTONCONFIG */, XF86XK_Buttonconfig },
-    { 0x241  /* KEY_TASKMANAGER */, XF86XK_Taskmanager },
-    { 0x242  /* KEY_JOURNAL */, XF86XK_Journal },
-    { 0x243  /* KEY_CONTROLPANEL */, XF86XK_ControlPanel },
-    { 0x244  /* KEY_APPSELECT */, XF86XK_AppSelect },
-    { 0x245  /* KEY_SCREENSAVER */, XF86XK_Screensaver },
-    { 0x246  /* KEY_VOICECOMMAND */, XF86XK_VoiceCommand },
-    { 0x247  /* KEY_ASSISTANT */, XF86XK_Assistant },
-    { 0x249  /* KEY_EMOJI_PICKER */, XF86XK_EmojiPicker },
-    { 0x24a  /* KEY_DICTATE */, XF86XK_Dictate },
-    { 0x24b  /* KEY_CAMERA_ACCESS_ENABLE */, XF86XK_CameraAccessEnable },
-    { 0x24c  /* KEY_CAMERA_ACCESS_DISABLE */, XF86XK_CameraAccessDisable },
-    { 0x24d  /* KEY_CAMERA_ACCESS_TOGGLE */, XF86XK_CameraAccessToggle },
-    { 0x24e  /* KEY_ACCESSIBILITY */, XF86XK_Accessibility },
-    { 0x24f  /* KEY_DO_NOT_DISTURB */, XF86XK_DoNotDisturb },
-    { 0x250  /* KEY_BRIGHTNESS_MIN */, XF86XK_BrightnessMin },
-    { 0x251  /* KEY_BRIGHTNESS_MAX */, XF86XK_BrightnessMax },
-    { 0x252  /* KEY_EPRIVACY_SCREEN_ON */, XF86XK_ElectronicPrivacyScreenOn },
-    { 0x253  /* KEY_EPRIVACY_SCREEN_OFF */, XF86XK_ElectronicPrivacyScreenOff },
-    { 0x254  /* KEY_ACTION_ON_SELECTION */, XF86XK_ActionOnSelection },
-    { 0x255  /* KEY_CONTEXTUAL_INSERT */, XF86XK_ContextualInsert },
-    { 0x256  /* KEY_CONTEXTUAL_QUERY */, XF86XK_ContextualQuery },
-    { 0x260  /* KEY_KBDINPUTASSIST_PREV */, XF86XK_KbdInputAssistPrev },
-    { 0x261  /* KEY_KBDINPUTASSIST_NEXT */, XF86XK_KbdInputAssistNext },
-    { 0x262  /* KEY_KBDINPUTASSIST_PREVGROUP */, XF86XK_KbdInputAssistPrevgroup },
-    { 0x263  /* KEY_KBDINPUTASSIST_NEXTGROUP */, XF86XK_KbdInputAssistNextgroup },
-    { 0x264  /* KEY_KBDINPUTASSIST_ACCEPT */, XF86XK_KbdInputAssistAccept },
-    { 0x265  /* KEY_KBDINPUTASSIST_CANCEL */, XF86XK_KbdInputAssistCancel },
-    { 0x266  /* KEY_RIGHT_UP */, XF86XK_RightUp },
-    { 0x267  /* KEY_RIGHT_DOWN */, XF86XK_RightDown },
-    { 0x268  /* KEY_LEFT_UP */, XF86XK_LeftUp },
-    { 0x269  /* KEY_LEFT_DOWN */, XF86XK_LeftDown },
-    { 0x26a  /* KEY_ROOT_MENU */, XF86XK_RootMenu },
-    { 0x26b  /* KEY_MEDIA_TOP_MENU */, XF86XK_MediaTopMenu },
-    { 0x26c  /* KEY_NUMERIC_11 */, XF86XK_Numeric11 },
-    { 0x26d  /* KEY_NUMERIC_12 */, XF86XK_Numeric12 },
-    { 0x26e  /* KEY_AUDIO_DESC */, XF86XK_AudioDesc },
-    { 0x26f  /* KEY_3D_MODE */, XF86XK_3DMode },
-    { 0x270  /* KEY_NEXT_FAVORITE */, XF86XK_NextFavorite },
-    { 0x271  /* KEY_STOP_RECORD */, XF86XK_StopRecord },
-    { 0x272  /* KEY_PAUSE_RECORD */, XF86XK_PauseRecord },
-    { 0x273  /* KEY_VOD */, XF86XK_VOD },
-    { 0x274  /* KEY_UNMUTE */, XF86XK_Unmute },
-    { 0x275  /* KEY_FASTREVERSE */, XF86XK_FastReverse },
-    { 0x276  /* KEY_SLOWREVERSE */, XF86XK_SlowReverse },
-    { 0x277  /* KEY_DATA */, XF86XK_Data },
-    { 0x278  /* KEY_ONSCREEN_KEYBOARD */, XF86XK_OnScreenKeyboard },
-    { 0x279  /* KEY_PRIVACY_SCREEN_TOGGLE */, XF86XK_PrivacyScreenToggle },
-    { 0x27a  /* KEY_SELECTIVE_SCREENSHOT */, XF86XK_SelectiveScreenshot },
-    { 0x27b  /* KEY_NEXT_ELEMENT */, XF86XK_NextElement },
-    { 0x27c  /* KEY_PREVIOUS_ELEMENT */, XF86XK_PreviousElement },
-    { 0x27d  /* KEY_AUTOPILOT_ENGAGE_TOGGLE */, XF86XK_AutopilotEngageToggle },
-    { 0x27e  /* KEY_MARK_WAYPOINT */, XF86XK_MarkWaypoint },
-    { 0x27f  /* KEY_SOS */, XF86XK_Sos },
-    { 0x280  /* KEY_NAV_CHART */, XF86XK_NavChart },
-    { 0x281  /* KEY_FISHING_CHART */, XF86XK_FishingChart },
-    { 0x282  /* KEY_SINGLE_RANGE_RADAR */, XF86XK_SingleRangeRadar },
-    { 0x283  /* KEY_DUAL_RANGE_RADAR */, XF86XK_DualRangeRadar },
-    { 0x284  /* KEY_RADAR_OVERLAY */, XF86XK_RadarOverlay },
-    { 0x285  /* KEY_TRADITIONAL_SONAR */, XF86XK_TraditionalSonar },
-    { 0x286  /* KEY_CLEARVU_SONAR */, XF86XK_ClearvuSonar },
-    { 0x287  /* KEY_SIDEVU_SONAR */, XF86XK_SidevuSonar },
-    { 0x288  /* KEY_NAV_INFO */, XF86XK_NavInfo },
-    { 0x289  /* KEY_BRIGHTNESS_MENU */, XF86XK_BrightnessAdjust },
-    { 0x290  /* KEY_MACRO1 */, XF86XK_Macro1 },
-    { 0x291  /* KEY_MACRO2 */, XF86XK_Macro2 },
-    { 0x292  /* KEY_MACRO3 */, XF86XK_Macro3 },
-    { 0x293  /* KEY_MACRO4 */, XF86XK_Macro4 },
-    { 0x294  /* KEY_MACRO5 */, XF86XK_Macro5 },
-    { 0x295  /* KEY_MACRO6 */, XF86XK_Macro6 },
-    { 0x296  /* KEY_MACRO7 */, XF86XK_Macro7 },
-    { 0x297  /* KEY_MACRO8 */, XF86XK_Macro8 },
-    { 0x298  /* KEY_MACRO9 */, XF86XK_Macro9 },
-    { 0x299  /* KEY_MACRO10 */, XF86XK_Macro10 },
-    { 0x29a  /* KEY_MACRO11 */, XF86XK_Macro11 },
-    { 0x29b  /* KEY_MACRO12 */, XF86XK_Macro12 },
-    { 0x29c  /* KEY_MACRO13 */, XF86XK_Macro13 },
-    { 0x29d  /* KEY_MACRO14 */, XF86XK_Macro14 },
-    { 0x29e  /* KEY_MACRO15 */, XF86XK_Macro15 },
-    { 0x29f  /* KEY_MACRO16 */, XF86XK_Macro16 },
-    { 0x2a0  /* KEY_MACRO17 */, XF86XK_Macro17 },
-    { 0x2a1  /* KEY_MACRO18 */, XF86XK_Macro18 },
-    { 0x2a2  /* KEY_MACRO19 */, XF86XK_Macro19 },
-    { 0x2a3  /* KEY_MACRO20 */, XF86XK_Macro20 },
-    { 0x2a4  /* KEY_MACRO21 */, XF86XK_Macro21 },
-    { 0x2a5  /* KEY_MACRO22 */, XF86XK_Macro22 },
-    { 0x2a6  /* KEY_MACRO23 */, XF86XK_Macro23 },
-    { 0x2a7  /* KEY_MACRO24 */, XF86XK_Macro24 },
-    { 0x2a8  /* KEY_MACRO25 */, XF86XK_Macro25 },
-    { 0x2a9  /* KEY_MACRO26 */, XF86XK_Macro26 },
-    { 0x2aa  /* KEY_MACRO27 */, XF86XK_Macro27 },
-    { 0x2ab  /* KEY_MACRO28 */, XF86XK_Macro28 },
-    { 0x2ac  /* KEY_MACRO29 */, XF86XK_Macro29 },
-    { 0x2ad  /* KEY_MACRO30 */, XF86XK_Macro30 },
-    { 0x2b0  /* KEY_MACRO_RECORD_START */, XF86XK_MacroRecordStart },
-    { 0x2b1  /* KEY_MACRO_RECORD_STOP */, XF86XK_MacroRecordStop },
-    { 0x2b2  /* KEY_MACRO_PRESET_CYCLE */, XF86XK_MacroPresetCycle },
-    { 0x2b3  /* KEY_MACRO_PRESET1 */, XF86XK_MacroPreset1 },
-    { 0x2b4  /* KEY_MACRO_PRESET2 */, XF86XK_MacroPreset2 },
-    { 0x2b5  /* KEY_MACRO_PRESET3 */, XF86XK_MacroPreset3 },
-    { 0x2b8  /* KEY_KBD_LCD_MENU1 */, XF86XK_KbdLcdMenu1 },
-    { 0x2b9  /* KEY_KBD_LCD_MENU2 */, XF86XK_KbdLcdMenu2 },
-    { 0x2ba  /* KEY_KBD_LCD_MENU3 */, XF86XK_KbdLcdMenu3 },
-    { 0x2bb  /* KEY_KBD_LCD_MENU4 */, XF86XK_KbdLcdMenu4 },
-    { 0x2bc  /* KEY_KBD_LCD_MENU5 */, XF86XK_KbdLcdMenu5 },
-    { 0x2bd  /* KEY_PERFORMANCE */, XF86XK_PerformanceMode },
+static struct present_screen_info loriePresentInfo = {
+        .get_crtc = loriePresentGetCrtc,
+        .get_ust_msc = loriePresentGetUstMsc,
+        .queue_vblank = loriePresentQueueVblank,
+        .abort_vblank = loriePresentAbortVblank,
+        // check_flip is called only in present_check_flip_window during window reconfiguration.
+        // The function should tell if pixmap can be used for flipping window.
+        // Since there are no other drivers involved here we assume it always fits.
+        .check_flip = TrueNoop,
+        .flip = loriePresentFlip,
+        .after_flip = loriePresentAfterFlip,
+        .unflip = loriePresentUnflip,
 };
-const size_t lorieExtendedKeysCount = sizeof(lorieExtendedKeys) / sizeof(lorieExtendedKeys[0]);
+
+void exaDDXDriverInit(__unused ScreenPtr pScreen) {}
+
+void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unused int depth, int usage_hint, __unused int bpp, int *new_fb_pitch) {
+    LoriePixmapPriv *priv;
+    size_t size = sizeof(LoriePixmapPriv);
+    *new_fb_pitch = 0;
+
+    priv = calloc(1, size);
+    if (!priv)
+        return NULL;
+
+    if (width == 0 || height == 0)
+        return priv;
+
+    uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
+    priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
+    *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
+
+    LorieBuffer_lock(priv->buffer, &priv->locked);
+    if (!priv->buffer) {
+        free(priv);
+        return NULL;
+    }
+
+    return priv;
+}
+
+void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
+    LoriePixmapPriv *priv = driverPriv;
+    if (priv->buffer) {
+        if (priv->locked)
+            LorieBuffer_unlock(priv->buffer);
+        lorieUnregisterBuffer(priv->buffer);
+        LorieBuffer_release(priv->buffer);
+    }
+    free(priv);
+}
+
+Bool lorieModifyPixmapHeader(PixmapPtr pPix, __unused int w, __unused int h, __unused int depth, __unused int bitsPerbppPixel, __unused int devKind, __unused void *data) {
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+    if (priv && data)
+        priv->mem = data;
+    return FALSE;
+}
+
+Bool loriePrepareAccess(PixmapPtr pPix, int index) {
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+    // The renderer reads whatever pixmap is currently the root window's one. That is the screen pixmap, but after a
+    // Present flip (a compositor presenting its back buffer) it is the client's pixmap instead. Writes into it
+    // must be covered by the request lock too, otherwise the renderer samples a half drawn frame: the picture
+    // flickers and gets cut in the middle while something is dragged with the compositor enabled.
+    if ((index == EXA_PREPARE_DEST || index == EXA_PREPARE_AUX_DEST) &&
+        (pScreenPtr->GetScreenPixmap(pScreenPtr) == pPix ||
+         (pScreenPtr->root && pScreenPtr->GetWindowPixmap(pScreenPtr->root) == pPix)))
+        lorieRequestLockTake();
+
+    if (!priv->locked && !priv->mem) {
+        int err = LorieBuffer_lock(priv->buffer, &priv->locked);
+        if (err) {
+            dprintf(2, "Failed to lock buffer, err %d\n", err);
+            return FALSE;
+        }
+        priv->wasLocked = FALSE;
+    } else
+        priv->wasLocked = TRUE;
+
+    pPix->devPrivate.ptr = priv->locked ?: priv->mem;
+    return TRUE;
+}
+
+void lorieFinishAccess(PixmapPtr pPix, int index) {
+    LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+
+    if (!priv->wasLocked) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        priv->wasLocked = FALSE;
+    }
+}
+
+static ExaDriverRec lorieExa = {
+        .exa_major = EXA_VERSION_MAJOR, .exa_minor = EXA_VERSION_MINOR, .maxX = 32767, .maxY = 32767,
+        .flags = EXA_OFFSCREEN_PIXMAPS | EXA_HANDLES_PIXMAPS, .pixmapPitchAlign = 32,
+        .PrepareSolid = FalseNoop, .PrepareCopy = FalseNoop, .PrepareComposite = FalseNoop,
+        .PixmapIsOffscreen = TrueNoop, .WaitMarker = VoidNoop,
+        .PrepareAccess = loriePrepareAccess, .FinishAccess = lorieFinishAccess,
+        .CreatePixmap2 = lorieCreatePixmap, .DestroyPixmap = lorieExaDestroyPixmap,
+        .ModifyPixmapHeader = lorieModifyPixmapHeader,
+};
+
+static LorieBuffer *lorieReceiveSocketBuffer(int fd, AHardwareBuffer_Desc *desc) {
+    AHardwareBuffer *ahb = NULL;
+    struct stat info;
+    uint8_t request = 1;
+    int r;
+
+    if (fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode)) {
+        log(ERROR, "DRI3: AHARDWAREBUFFER_SOCKET_FD: fd is not a socket");
+        return NULL;
+    }
+    // Sending signal to other end of socket to send buffer.
+    if (write(fd, &request, 1) != 1) {
+        log(ERROR, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to write to socket: %s", strerror(errno));
+        return NULL;
+    }
+    if ((r = LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(fd, &ahb)) != 0 || !ahb) {
+        log(ERROR, "DRI3: AHARDWAREBUFFER_SOCKET_FD: failed to obtain AHardwareBuffer from socket: %d", r);
+        return NULL;
+    }
+    LorieBuffer_describeAHardwareBuffer(ahb, desc);
+    if (desc->format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM
+        && desc->format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+        && desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM) {
+        log(ERROR, "DRI3: AHARDWAREBUFFER_SOCKET_FD: wrong format of AHardwareBuffer. Must be one of: AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM (stands for 5).");
+        LorieBuffer_releaseAHardwareBuffer(ahb);
+        return NULL;
+    }
+    return LorieBuffer_wrapAHardwareBuffer(ahb);
+}
+
+static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *fds, CARD16 width, CARD16 height,
+                                    const CARD32 *strides, const CARD32 *offsets, CARD8 depth, __unused CARD8 bpp, CARD64 modifier) {
+#define fail(msg, ...) do { log(ERROR, msg, ##__VA_ARGS__); goto fail; } while(0)
+#define check(cond, msg, ...) if ((cond)) fail(msg, ##__VA_ARGS__)
+    const CARD64 AHARDWAREBUFFER_SOCKET_FD = 1255;
+    const CARD64 AHARDWAREBUFFER_FLIPPED_SOCKET_FD = 1256;
+    const CARD64 RAW_MMAPPABLE_FD = 1274;
+    AHardwareBuffer_Desc desc = {0};
+    PixmapPtr pixmap = NullPixmap;
+    LoriePixmapPriv *priv = NULL;
+
+    check(num_fds > 1, "DRI3: More than 1 fd");
+    check(modifier != RAW_MMAPPABLE_FD && modifier != AHARDWAREBUFFER_SOCKET_FD && modifier != AHARDWAREBUFFER_FLIPPED_SOCKET_FD &&
+          modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR, "DRI3: Modifier is not RAW_MMAPPABLE_FD or AHARDWAREBUFFER_SOCKET_FD");
+
+    pixmap = screen->CreatePixmap(screen, 0, 0, depth, 0);
+    check(!pixmap, "DRI3: failed to create pixmap");
+
+    priv = exaGetPixmapDriverPrivate(pixmap);
+    check(!priv, "DRI3: failed to obtain pixmap private");
+
+    priv->imported = true;
+
+    if (modifier == DRM_FORMAT_MOD_INVALID || modifier == DRM_FORMAT_MOD_LINEAR || modifier == RAW_MMAPPABLE_FD) {
+        check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
+        screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, strides[0], NULL);
+        if (lorieServerDebugEnabled)
+            log(INFO, "DRI3: imported raw fd, modifier %llu, %ux%u stride %u", (unsigned long long) modifier, width, height, strides[0]);
+        return pixmap;
+    }
+
+    if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD) {
+        priv->flipped = modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD;
+        check(!(priv->buffer = lorieReceiveSocketBuffer(fds[0], &desc)), "DRI3: failed to import AHardwareBuffer");
+
+        screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, desc.stride * 4, NULL);
+        if (lorieServerDebugEnabled)
+            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, %ux%u stride %u", (unsigned long long) modifier, desc.width, desc.height, desc.stride);
+    }
+
+    return pixmap;
+
+    fail:
+    if (pixmap)
+        screen->DestroyPixmap(pixmap);
+
+    return NULL;
+}
+
+static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD32 **formats) {
+    static CARD32 format = DRM_FORMAT_ARGB8888;
+    *num_formats = 1;
+    *formats = &format;
+    return TRUE;
+}
+
+static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_t *num_modifiers, uint64_t **modifiers) {
+    static uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+
+    if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
+        *num_modifiers = 0;
+        *modifiers = NULL;
+        return TRUE;
+    }
+
+    *num_modifiers = 1;
+    *modifiers = &modifier;
+    return TRUE;
+}
+
+static dri3_screen_info_rec lorieDri3Info = {
+        .version = 2,
+        .fds_from_pixmap = FalseNoop,
+        .pixmap_from_fds = loriePixmapFromFds,
+        .get_formats = lorieGetFormats,
+        .get_modifiers = lorieGetModifiers,
+        .get_drawable_modifiers = FalseNoop
+};
+
+static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }
+static void drawableCopySubBuffer(unused __GLXdrawable * basePrivate, unused int x, unused int y, unused int w, unused int h) {}
+static __GLXdrawable * createDrawable(unused ClientPtr client, __GLXscreen * screen, DrawablePtr pDraw,
+                                      unused XID drawId, int type, XID glxDrawId, __GLXconfig * glxConfig) {
+    __GLXdrawable *private = calloc(1, sizeof *private);
+    if (private == NULL)
+        return NULL;
+
+    if (!__glXDrawableInit(private, screen, pDraw, type, glxDrawId, glxConfig)) {
+        free(private);
+        return NULL;
+    }
+
+    private->destroy = (void (*)(__GLXdrawable *)) free;
+    private->swapBuffers = drawableSwapBuffers;
+    private->copySubBuffer = drawableCopySubBuffer;
+
+    return private;
+}
+
+static void glXDRIscreenDestroy(__GLXscreen *baseScreen) {
+    free(baseScreen->GLXextensions);
+    free(baseScreen->GLextensions);
+    free(baseScreen->visuals);
+    free(baseScreen);
+}
+
+static __GLXscreen *glXDRIscreenProbe(ScreenPtr pScreen) {
+    __GLXscreen *screen;
+
+    screen = calloc(1, sizeof *screen);
+    if (screen == NULL)
+        return NULL;
+
+    screen->destroy = glXDRIscreenDestroy;
+    screen->createDrawable = createDrawable;
+    screen->pScreen = pScreen;
+    screen->fbconfigs = lorieGlxConfigs();
+    screen->glvnd = "mesa";
+
+    __glXInitExtensionEnableBits(screen->glx_enable_bits);
+    /* There is no real GLX support, but anyways swrast reports it. */
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_MESA_copy_sub_buffer");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_no_config_context");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_create_context");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_create_context_no_error");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_create_context_profile");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_create_context_es_profile");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_create_context_es2_profile");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_framebuffer_sRGB");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_ARB_fbconfig_float");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_fbconfig_packed_float");
+    __glXEnableExtension(screen->glx_enable_bits, "GLX_EXT_texture_from_pixmap");
+    __glXScreenInit(screen, pScreen);
+
+    return screen;
+}
+
+__GLXprovider __glXDRISWRastProvider = {
+        glXDRIscreenProbe,
+        "DRISWRAST",
+        NULL
+};

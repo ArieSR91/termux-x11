@@ -794,6 +794,51 @@ static float panToCursor(float offset, float cursor, float shown, float total) {
     return fmaxf(0.f, fminf(offset, total - shown));
 }
 
+// Snapshot of the last root window frame that was copied while the X server was locked.
+// Frames that only move the cursor are composed from it and do not have to wait for the X server lock, which is
+// held almost all the time while something heavy (a compositor, a dragged window) is drawing. Waiting for it was
+// what made the cursor move in steps. The snapshot keeps the buffer's own row order (row 0 at t = 0).
+static GLuint snapFbo = 0, snapTex = 0;
+static int snapW = 0, snapH = 0;
+static bool snapValid = false, snapBroken = false;
+static uint64_t snapBufferId = 0;
+
+static bool ensureSnapshot(int w, int h) {
+    if (snapBroken || w <= 0 || h <= 0)
+        return false;
+    if (snapTex && snapFbo && snapW == w && snapH == h)
+        return true;
+
+    if (snapFbo)
+        glDeleteFramebuffers(1, &snapFbo);
+    if (snapTex)
+        glDeleteTextures(1, &snapTex);
+    snapFbo = snapTex = 0;
+    snapValid = false;
+
+    glGenTextures(1, &snapTex);
+    glBindTexture(GL_TEXTURE_2D, snapTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &snapFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, snapFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, snapTex, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!ok) {
+        loge("Root snapshot framebuffer is incomplete (%dx%d), drawing directly", w, h);
+        glDeleteFramebuffers(1, &snapFbo);
+        glDeleteTextures(1, &snapTex);
+        snapFbo = snapTex = 0;
+        snapBroken = true;
+        return false;
+    }
+    snapW = w;
+    snapH = h;
+    return true;
+}
+
 void Renderer::redrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
     const LorieBuffer_Desc *desc = nullptr;
@@ -884,6 +929,11 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
             panSourceTop = other;
     }
 
+    // The "moved" flag must be cleared BEFORE the position is read. It used to be cleared after drawing, which
+    // silently dropped every move that arrived while we were waiting for the X server lock and drawing: the last
+    // position of a movement was then never presented until the next move came, and the cursor visibly lagged
+    // behind (and jumped) while dragging. Now a move arriving later just sets the flag again for the next frame.
+    state->cursor.moved = FALSE;
     auto cursorX = (float) state->cursor.x, cursorY = (float) state->cursor.y; // snapshot, cursor.x/y is updated lock-free
 
     if (pinchAnchorSourceX >= 0.f) {
@@ -914,22 +964,54 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     reportViewport(renderViewportX, renderViewportY, renderViewportW, renderViewportH,
                    sourceLeft, sourceTop, logicalSourceWidth, logicalSourceHeight);
 
-    // We should signal X server to not use root window while we actively copy it
-    lockServerState(state, connFd());
-    if (state->rendererRelock)
-        syncRootForGpu(buffer);
-    state->drawRequested = FALSE;
+    const bool snap = ensureSnapshot(desc->width, desc->height);
+    const bool needRoot = !snap || state->drawRequested || !snapValid || snapBufferId != state->rootWindowTextureID;
+    bool locked = false;
 
-    LorieBuffer_bindTexture(buffer);
-    if (desc->type == LORIEBUFFER_FD)
-        xfactor = (float) desc->width/(float) desc->stride;
-    drawRegion(0, -1.f, -1.f, 1.f, 1.f,
-               sourceLeft / (float) desc->width * xfactor, sourceTop / (float) desc->height,
-               (sourceLeft + sourceWidth) / (float) desc->width * xfactor,
-               (sourceTop + sourceHeight) / (float) desc->height,
-               LorieBuffer_isRgba(buffer));
-    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
-    glFlush();
+    if (needRoot) {
+        // We should signal X server to not use root window while we actively copy it
+        lockServerState(state, connFd());
+        locked = true;
+        if (state->rendererRelock)
+            syncRootForGpu(buffer);
+        state->drawRequested = FALSE;
+
+        LorieBuffer_bindTexture(buffer);
+        if (desc->type == LORIEBUFFER_FD)
+            xfactor = (float) desc->width/(float) desc->stride;
+
+        if (snap) {
+            // Copy the whole root window into the snapshot and give control back to the X server right away.
+            glBindFramebuffer(GL_FRAMEBUFFER, snapFbo);
+            glViewport(0, 0, snapW, snapH);
+            drawRegion(0, -1.f, -1.f, 1.f, 1.f, 0.f, 1.f, xfactor, 0.f, LorieBuffer_isRgba(buffer));
+            fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
+            glFlush();
+            waitForFence(egl_display, fence, 0);
+            lorie_mutex_unlock(&state->lock, &state->lockingPid);
+            locked = false;
+
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(renderViewportX, surfaceH - renderViewportY - renderViewportH, renderViewportW, renderViewportH);
+            snapValid = true;
+            snapBufferId = state->rootWindowTextureID;
+        } else {
+            drawRegion(0, -1.f, -1.f, 1.f, 1.f,
+                       sourceLeft / (float) desc->width * xfactor, sourceTop / (float) desc->height,
+                       (sourceLeft + sourceWidth) / (float) desc->width * xfactor,
+                       (sourceTop + sourceHeight) / (float) desc->height,
+                       LorieBuffer_isRgba(buffer));
+            fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
+            glFlush();
+        }
+    }
+
+    if (snap)
+        drawRegion(snapTex, -1.f, -1.f, 1.f, 1.f,
+                   sourceLeft / (float) snapW, sourceTop / (float) snapH,
+                   (sourceLeft + sourceWidth) / (float) snapW,
+                   (sourceTop + sourceHeight) / (float) snapH,
+                   false);
 
     if (state->cursor.updated) {
         log("Xlorie: updating cursor\n");
@@ -940,14 +1022,20 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
     }
 
-    state->cursor.moved = FALSE;
+    // Take a fresh cursor position: the one read above can be stale after waiting for the X server lock.
+    // `moved` is deliberately not cleared again here: a move that landed since the first snapshot keeps it
+    // raised, so the next frame re-pans if needed.
+    cursorX = (float) state->cursor.x;
+    cursorY = (float) state->cursor.y;
     drawCursor(sourceWidth, sourceHeight, sourceLeft, sourceTop, cursorX, cursorY);
     glFlush();
 
-    // Wait until root window drawing is finished before giving control back to X server
-    waitForFence(egl_display, fence, 0);
     state->waitForNextFrame = true;
-    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    if (locked) {
+        // Direct drawing (no snapshot): wait until root window drawing is finished before giving control back to X server
+        waitForFence(egl_display, fence, 0);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    }
 
     if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
         printEglError("Failed to swap buffers", __LINE__);
@@ -1014,6 +1102,7 @@ void Renderer::threadLoop() {
             state = pendingState;
             pendingState = nullptr;
             stateChanged = false;
+            snapValid = false; // a new X server connection: never show the old picture
             waitingForBuffers = false;
 
             if (state)
@@ -1028,8 +1117,10 @@ void Renderer::threadLoop() {
                 munmap(oldState, sizeof(*oldState));
         }
 
-        if (windowChanged)
+        if (windowChanged) {
             refreshContext();
+            snapValid = false;
+        }
 
         // Attach all pending buffers to GL.
         pthread_spin_lock(&bufferLock);

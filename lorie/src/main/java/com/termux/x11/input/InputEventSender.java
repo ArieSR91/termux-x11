@@ -11,6 +11,8 @@ import static com.termux.x11.input.InputStub.*;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import android.graphics.PointF;
+import android.os.Looper;
+import android.view.Choreographer;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -115,37 +117,83 @@ public final class InputEventSender {
     public void sendMouseEvent(PointF pos, int button, boolean down, boolean relative) {
         if (!buttons.contains(button))
             return;
+        flushPendingCursorMove();
         mInjector.sendMouseEvent(pos != null ? (int) pos.x : 0, pos != null ? (int) pos.y : 0, button, down, relative);
     }
 
     public void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouse) {
+        flushPendingCursorMove();
         mInjector.sendStylusEvent(x, y, pressure, tiltX, tiltY, orientation, buttons, eraser, mouse);
     }
 
     public void sendMouseDown(int button, boolean relative) {
-        if (!buttons.contains(button)) 
+        if (!buttons.contains(button))
             return;
+        flushPendingCursorMove();
         mInjector.sendMouseEvent(0, 0, button, true, relative);
     }
 
     public void sendMouseUp(int button, boolean relative) {
         if (!buttons.contains(button))
             return;
+        flushPendingCursorMove();
         mInjector.sendMouseEvent(0, 0, button, false, relative);
     }
 
     public void sendMouseClick(int button, boolean relative) {
         if (!buttons.contains(button))
             return;
+        flushPendingCursorMove();
         mInjector.sendMouseEvent(0, 0, button, true, relative);
         mInjector.sendMouseEvent(0, 0, button, false, relative);
     }
 
     public void sendCursorMove(float x, float y, boolean relative) {
+        // Keep ordering with respect to deltas that are still waiting for the next frame.
+        flushPendingCursorMove();
         mInjector.sendMouseEvent(x, y, BUTTON_UNDEFINED, false, relative);
     }
 
+    // Relative finger movement (trackpad mode) used to be forwarded event by event. Android delivers those
+    // in uneven bursts (especially with unbuffered dispatch), the X server stamps each of them with its own
+    // arrival time and its pointer acceleration derives the speed from those stamps, so the gain jumped
+    // around and the cursor moved in steps. Deltas are now summed and sent once per display frame, which gives
+    // the server evenly spaced events and one cursor position per frame. Sub-pixel remainders are preserved
+    // because the sum is sent as float.
+    private float mPendingDx, mPendingDy;
+    private boolean mFlushPosted;
+    private Choreographer mChoreographer;
+    private final Choreographer.FrameCallback mFlushCallback = frameTimeNanos -> {
+        mFlushPosted = false;
+        flushPendingCursorMove();
+    };
+
+    private void flushPendingCursorMove() {
+        if (mPendingDx == 0f && mPendingDy == 0f)
+            return;
+        float dx = mPendingDx, dy = mPendingDy;
+        mPendingDx = mPendingDy = 0f;
+        mInjector.sendMouseEvent(dx, dy, BUTTON_UNDEFINED, false, true);
+    }
+
+    /** Relative cursor move that is merged with other moves happening within the same display frame. */
+    public void sendCursorMoveCoalesced(float dx, float dy) {
+        if (mChoreographer == null && Looper.myLooper() != null)
+            mChoreographer = Choreographer.getInstance();
+        if (mChoreographer == null) {
+            sendCursorMove(dx, dy, true);
+            return;
+        }
+        mPendingDx += dx;
+        mPendingDy += dy;
+        if (!mFlushPosted) {
+            mFlushPosted = true;
+            mChoreographer.postFrameCallback(mFlushCallback);
+        }
+    }
+
     public void sendMouseWheelEvent(float distanceX, float distanceY) {
+        flushPendingCursorMove();
         mInjector.sendMouseWheelEvent(distanceX, distanceY);
     }
 

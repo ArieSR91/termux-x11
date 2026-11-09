@@ -98,6 +98,15 @@ public class TouchInputHandler {
     /** Used to disambiguate a 2-finger gesture as a swipe or a pinch. */
     private final SwipeDetector mSwipePinchDetector;
 
+    // Winlator-like right click: while one finger slides the cursor, a short tap of a second finger right-clicks.
+    private static final long SECOND_FINGER_TAP_MAX_MS = 300;
+    private int mPrimaryPointerId = -1;
+    private float mPrimaryDownX, mPrimaryDownY, mPrimaryLastX, mPrimaryLastY;
+    private boolean mPrimaryMoved;
+    private int mSecondTapPointerId = -1;
+    private long mSecondTapDownTime;
+    private float mSecondTapDownX, mSecondTapDownY;
+
     private InputStrategyInterface mInputStrategy;
     private final InputEventSender mInjector;
     private final MainActivity mActivity;
@@ -366,6 +375,7 @@ public class TouchInputHandler {
                 mZoomer.onTouchEvent(event);
             mTapDetector.onTouchEvent(event);
             mSwipePinchDetector.onTouchEvent(event);
+            trackSecondFingerTap(event);
 
             // For hardware touchpad in DeX (captured mode), handle physical click buttons
             if ((event.getSource() & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD) {
@@ -400,6 +410,95 @@ public class TouchInputHandler {
         }
 
         return false;
+    }
+
+    /**
+     * Right click with a second finger, like Winlator's trackpad: after the first finger has slid across the
+     * screen (moving the cursor), briefly tapping with another finger sends a right click at the cursor.
+     * While that second finger is down the first one keeps moving the cursor, instead of freezing it.
+     */
+    private void trackSecondFingerTap(MotionEvent e) {
+        if (!(mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy)) {
+            mSecondTapPointerId = -1;
+            return;
+        }
+        float slop = ViewConfiguration.get(mActivity).getScaledTouchSlop();
+        switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                mPrimaryPointerId = e.getPointerId(0);
+                mPrimaryDownX = mPrimaryLastX = e.getX(0);
+                mPrimaryDownY = mPrimaryLastY = e.getY(0);
+                mPrimaryMoved = false;
+                mSecondTapPointerId = -1;
+                break;
+
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (e.getPointerCount() == 2 && mPrimaryMoved) {
+                    int idx = e.getActionIndex();
+                    mSecondTapPointerId = e.getPointerId(idx);
+                    mSecondTapDownTime = e.getEventTime();
+                    mSecondTapDownX = e.getX(idx);
+                    mSecondTapDownY = e.getY(idx);
+                } else
+                    mSecondTapPointerId = -1;
+                break;
+
+            case MotionEvent.ACTION_MOVE: {
+                int p = e.findPointerIndex(mPrimaryPointerId);
+                if (p < 0)
+                    break;
+                float x = e.getX(p), y = e.getY(p);
+                if (!mPrimaryMoved && Math.hypot(x - mPrimaryDownX, y - mPrimaryDownY) > slop)
+                    mPrimaryMoved = true;
+
+                if (mSecondTapPointerId != -1) {
+                    int s = e.findPointerIndex(mSecondTapPointerId);
+                    if (s < 0 || Math.hypot(e.getX(s) - mSecondTapDownX, e.getY(s) - mSecondTapDownY) > slop)
+                        mSecondTapPointerId = -1; // the second finger slid: it is a gesture, not a tap
+                    else if (e.getPointerCount() == 2 && !mSuppressCursorMovement) {
+                        // The gesture detector ignores multi-finger moves, keep the cursor following the first finger.
+                        float dx = mPrimaryLastX - x, dy = mPrimaryLastY - y;
+                        if (mInjector.scaleTouchpad) {
+                            dx *= mRenderData.scale.x;
+                            dy *= mRenderData.scale.y;
+                        }
+                        moveCursorByOffset(dx, dy);
+                    }
+                }
+                mPrimaryLastX = x;
+                mPrimaryLastY = y;
+                break;
+            }
+
+            case MotionEvent.ACTION_POINTER_UP: {
+                int idx = e.getActionIndex();
+                int id = e.getPointerId(idx);
+                if (id == mSecondTapPointerId) {
+                    mSecondTapPointerId = -1;
+                    if (e.getEventTime() - mSecondTapDownTime <= SECOND_FINGER_TAP_MAX_MS)
+                        mInputStrategy.onTap(InputStub.BUTTON_RIGHT);
+                } else if (id == mPrimaryPointerId && e.getPointerCount() == 2) {
+                    // The first finger left, the remaining one takes over as the cursor finger.
+                    int other = 1 - idx;
+                    mPrimaryPointerId = e.getPointerId(other);
+                    mPrimaryDownX = mPrimaryLastX = e.getX(other);
+                    mPrimaryDownY = mPrimaryLastY = e.getY(other);
+                    mPrimaryMoved = false;
+                    mSecondTapPointerId = -1;
+                }
+                break;
+            }
+
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                mSecondTapPointerId = -1;
+                mPrimaryPointerId = -1;
+                mPrimaryMoved = false;
+                break;
+
+            default:
+                break;
+        }
     }
 
     public void handleInputTransformChanged(int screenWidth, int screenHeight, Matrix inputTransform) {
@@ -592,7 +691,7 @@ public class TouchInputHandler {
 
     private void moveCursorByOffset(float deltaX, float deltaY) {
         if (mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy)
-            mInjector.sendCursorMove(-deltaX, -deltaY, true);
+            mInjector.sendCursorMoveCoalesced(-deltaX, -deltaY);
         else if (mInputStrategy instanceof InputStrategyInterface.SimulatedTouchInputStrategy) {
             PointF cursorPos = mRenderData.getCursorPosition();
             cursorPos.offset(-deltaX, -deltaY);
